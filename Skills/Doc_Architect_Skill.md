@@ -1,7 +1,7 @@
 ```yaml
 名称: Doc_Architect_Skill (文档架构师技能)
 依赖文档索引:
-  - Doc_Writer_Role_Profile (角色偏好库)
+  - Doc-Writer (角色偏好库)
   - Single_Responsibility_Standard (单一职责模块标准)
 功能: 引导用户锁定写作意图、对齐读写角色偏好、构建符合单一职责和逻辑树结构的模块化技术文档。
 ```
@@ -81,5 +81,5 @@
 ---
 
 ## 附录
-> [1] `Doc_Writer_Role_Profile`：定义了包括“资深架构师”、“初级开发”、“产品经理”等角色的读写偏好。
+> [1] `Doc-Writer`：定义了包括“资深架构师”、“初级开发”、“产品经理”等角色的读写偏好。
 > [2] `Single_Responsibility_Standard`：详细阐述了如何评估文档是否超出了单一职责的边界。
