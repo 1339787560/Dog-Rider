@@ -1,69 +1,78 @@
 ```yaml
 Name: CLAUDE.md (Agent Runtime & Skill Loader Guide)
 Dependencies:
-  - skills/*.md (Individual Skill Specifications)
+  - Skills/*.md (Individual Skill Specifications)
 Function: Guides the Agent to implement progressive loading by caching only Skill headers and dynamically loading full content on demand.
 ```
 
-## Section Index & Dependencies
-- Upstream Dependencies:
-  - Repository Directory Structure (`skills/`)
-- Downstream Dependencies:
-  - Task Execution Runtime
+---
 
-### Overview of Agent Runtime Specification
-This document establishes the execution protocol for the Agent within this repository, focusing strictly on progressive skill loading to optimize active context window usage. Reading Agents may selectively load specific sections based on their execution phase.
+## Startup Protocol — EXECUTE BEFORE FIRST RESPONSE
 
-1. Skill Indexing Protocol: Scanning and registering only the metadata headers of available skills.
-2. Progressive Loading & Activation: Dynamically reading the full content of a skill only when triggered.
-3. Future Repository Specifications: Placeholder for commands, test suites, and project-specific guidelines.
+This protocol is mandatory. Execute these steps immediately at session start, before responding to any user message.
 
-#### Core Terminology Table
-The following terminology is registered for this runtime environment:
+### Step 1: Scan Skills Directory
+```
+Glob Skills/*.md → obtain file list
+```
 
-| Term | Type | Definition |
-| :--- | :--- | :--- |
-| **Progressive Loading** | Strategy | A memory-optimization method that caches metadata first, delaying full-file reads until triggered. |
-| **Skill Header** | Format | The YAML block at the beginning of each skill file declaring its name, purpose, and trigger. |
-| **Dynamic Activation** | Action | The process of executing a full file read tool to load a skill's body once its trigger matches user intent. |
+### Step 2: Filter Internal Documents
+- Exclude files starting with `_` (internal documents, not directly loadable)
+- Examples: `_Doc_Architect_Skill.md`, `_Doc_System_Framework.md`
+- These are loaded indirectly via routing Skills (e.g., `doc-write`)
+
+### Step 3: Read YAML Headers Only
+For each file found, `Read` enough lines to capture the entire opening YAML block (from `` ```yaml `` to the closing `` ``` ``). The YAML block length varies per skill — do NOT use a fixed line count. Stop reading at the closing `` ``` `` marker; do NOT read beyond it into the markdown body.
+
+### Step 4: Build Skill Route Table
+Extract these three fields from each YAML header (per Skill_Architect_Specification standard):
+- `Skill_Name`
+- `Purpose`
+- `Execution_Trigger`
+
+Register the extracted metadata as the **Skill Route Table** in session memory. Example format:
+
+```
+| Skill_Name | Purpose | Execution_Trigger | File |
+|---|---|---|---|
+| Skill_Architect_Specification | Instructs the Agent on how to design Skills | User requests new Skill creation | Skills/Skill_Architect_Specification.md |
+```
+
+### Step 5: Evaluate Triggers on Every User Request
+For each user message, compare intent against `Execution_Trigger` values in the Route Table.
+- **Match found** → `Read` the full content of that skill file. Apply its instructions for the current task.
+- **No match** → Do not load any skill. Proceed normally.
 
 ---
 
-## Skill Loader Specifications
+## Skill Loader Specification
 
-### Detail 1: Skill Indexing Protocol
-Upon repository initialization, the Agent must not read the full contents of files inside the `skills/` directory.
-- **Header Scanning Process:**
-  - The Agent must scan the `skills/` directory.
-  - Using file tools, the Agent must read only the initial YAML frontmatter (the Skill Header) of each markdown file.
-- **Index Registration:**
-  - Extract the `Name`, `Purpose`, and `Execution_Trigger` from each header.
-  - Store this metadata in the active session memory as a "Skill Route Table" to serve as a lightweight lookup index.
+### Progressive Loading Strategy
+A memory-optimization method: cache metadata first (Route Table), delay full-file reads until triggered. This keeps the context window lean at startup regardless of how many skills exist.
 
-### Detail 2: Progressive Loading & Activation
-Full skill instructions must remain unloaded until explicitly required by the current task context.
-- **Trigger Evaluation:**
-  - For every user request, the Agent compares the input against the registered `Execution_Trigger` parameters in the Skill Route Table.
-- **On-Demand Loading:**
-  - Only when a trigger match is confirmed, the Agent executes a full read command (e.g., `view_file`) on that specific skill file.
-  - The newly loaded instructions are then applied as temporary system prompts for the duration of the current task.
-  - > Example: If the user requests a new skill generation, the Agent triggers and reads `skills/Doc_Architect_Skill.md` to guide the output.
+### Skill Header Format
+Per `Skill_Architect_Specification.md`, every skill file MUST open with a YAML block containing exactly:
+- `Skill_Name` — unique identifier
+- `Purpose` — one-line description of what the skill does
+- `Execution_Trigger` — condition that activates this skill
 
----
+Files in `Skills/` that do not conform to this header format should not be indexed. Report the mismatch to the user.
 
-## Future Repository Specifications
+### Internal Document Convention
+- Files prefixed with `_` are internal documents — they are not loaded during startup and do not appear in the Route Table
+- They are loaded indirectly when a routing Skill (e.g., `doc-write`) directs the Agent to read them
+- This convention prevents large internal specifications from consuming context at startup
 
-### Detail 3: Repository Commands [Placeholder]
-- **Build Commands:**
-  - *[Placeholder for future compilation and build commands]*
-- **Testing Commands:**
-  - *[Placeholder for future test execution commands]*
-
-### Detail 4: Code Style & Guidelines [Placeholder]
-- **Style Rules:**
-  - *[Placeholder for future linter, formatting, and structural guidelines]*
+### Dynamic Activation Rules
+- A skill's full content is loaded only when its `Execution_Trigger` matches user intent.
+- The loaded instructions apply as temporary context for the duration of the current task only.
+- After the task completes, the skill content is not retained in active context (the Route Table entry persists).
 
 ---
 
-## Appendix
-> [1] `skills/` Directory: The dedicated storage for modular Agent skills adhering to the single responsibility principle.
+## Repository Commands [Placeholder]
+- Build Commands: *[Pending]*
+- Testing Commands: *[Pending]*
+
+## Code Style & Guidelines [Placeholder]
+- Style Rules: *[Pending]*

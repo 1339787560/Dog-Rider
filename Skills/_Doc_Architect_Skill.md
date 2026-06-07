@@ -1,9 +1,7 @@
 ```yaml
-名称: Doc_Architect_Skill (文档架构师技能)
-依赖文档索引:
-  - Doc-Writer (角色偏好库)
-  - Single_Responsibility_Standard (单一职责模块标准)
-功能: 引导用户锁定写作意图、对齐读写角色偏好、构建符合单一职责和逻辑树结构的模块化技术文档。
+Skill_Name: Doc_Architect_Skill
+Purpose: Guides the user to lock writing intent, align reader/writer role preferences, and build modular technical documents adhering to single responsibility and logical tree structure.
+Execution_Trigger: Activated when the user requests document architecture design, document structure planning, or writing role alignment.
 ```
 
 ## 依赖文档索引与角色声明
@@ -26,17 +24,17 @@
 
 | 术语名称 | 术语类型 | 含义解释 |
 | :--- | :--- | :--- |
-| **Doc-Writer** | 核心概念 | 存储并记录各种“写作角色”与“阅读角色”双向偏好和个性的文档库。 |
 | **单职模块化** | 架构原则 | 每个文档如同软件模块，只承担单一职责，若超出则必须拆分。 |
 | **信息首尾结构** | 排版原则 | 在标题内部，将易懂结论前置，细节后置，参考引用放置在最末尾。 |
+| **Role Profile** | 外部术语（来自 `_Doc_System_Framework`） | 定义角色 Expression 偏好与 Format Catalog 的 Profile 文件，存放在 `Roles/` 目录下。 |
 
 ---
 
 ### 详细规范 1：交互与意图锁定协议
 在正式动笔撰写任何内容之前，必须启动固定化的交互流程，严禁直接输出大篇幅正文。
 - **角色引导与初始化：**
-  - 必须引导用户从 `Doc-Writer` 中选择已有的角色作为“写作角色”和“阅读角色”。
-  - 若所需角色的阅读/写作偏好尚未形成，须提示用户先更新 `Doc-Writer` 或提供外部个性文档索引。
+  - 必须引导用户从 `Roles/` 目录下已有的 Role Profile 中选择”写作角色”和”阅读角色”。
+  - 若所需角色的 Role Profile 尚不存在，须提示用户先通过 `_Doc_System_Framework` 创建角色。
 - **固定化结构提问：**
   - Agent 须向用户提出明确的问题，要求其限制写作目的、核心重点。
   - 用户可在此阶段提供初始规则或粗略的逻辑树大纲。
@@ -79,7 +77,3 @@
   - 若依赖文档较多，允许在文档最后增加“附录”章节进行统一指向。
 
 ---
-
-## 附录
-> [1] `Doc-Writer`：定义了包括“资深架构师”、“初级开发”、“产品经理”等角色的读写偏好。
-> [2] `Single_Responsibility_Standard`：详细阐述了如何评估文档是否超出了单一职责的边界。
