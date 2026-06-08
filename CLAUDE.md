@@ -11,3 +11,4 @@ AI Agent Skill 管理框架。通过标准化 Skill 文件，为 Agent 提供可
 ## 元规范
 
 Skill 写作规范见 `Skills/Skill-Writer.md`。创建新 Skill 时必须遵循此规范。
+Doc 写作规范见 `Skills/Doc-Writer.md`。创建新 Doc 时必须遵循此规范。
