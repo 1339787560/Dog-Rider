@@ -11,7 +11,8 @@ Type: POC
 1. 缓存机制：DeepSeek 前缀缓存的工作原理
 2. POC 验证：五个问题的结论（含实测数据）
 3. 设计依据：ContextManager 的三区模型与缓存对齐
-4. 结论：优化优先级与费用结构拆解
+4. 结论：优化优先级、费用结构拆解、并发策略
+5. 应用场景：Parallel Fork 模式（用户主动开启，context fork 后并发执行）
 
 ---
 
@@ -95,6 +96,25 @@ DeepSeek 的缓存系统基于 Sliding Window Attention，采用 RadixTree（基
 **缓存份数验证：** 系统可创建的缓存单元数量取决于 GPU 内存，无硬性上限。但单次请求只利用一个最长前缀匹配。因此"9 份缓存"在系统层面是可行的（9 个不同的前缀单元），但单次请求只会命中其中最匹配的 1 个。
 
 **设计启示：** ContextManager 应确保永久冻结区（system prompt + 索引文档）的内容稳定不变，使其成为所有请求共享的最长前缀。不同任务的差异内容放在自然增长区（前缀之后），不影响缓存命中。
+
+**实测验证（10 组不同前缀）：**
+
+| 前缀 | prompt | hit | miss | 结果 |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 (TypeScript/CP) | 219 | 128 | 91 | HIT |
+| 2 (Python/ML) | 176 | 128 | 48 | HIT |
+| 3 (DevOps) | 165 | 128 | 37 | HIT |
+| 4 (Frontend) | 165 | 128 | 37 | HIT |
+| 5 (Backend) | 162 | 128 | 34 | HIT |
+| 6 (Security) | 166 | 128 | 38 | HIT |
+| 7 (Mobile) | 156 | 128 | 28 | HIT |
+| 8 (Database) | 155 | 128 | 27 | HIT |
+| 9 (Game) | 160 | 128 | 32 | HIT |
+| 10 (Cloud) | 150 | 128 | 22 | HIT |
+
+- **10/10 前缀全部被缓存**
+- **最小缓存块：128 token**（所有命中均为 128，低于此值的前缀不被缓存）
+- **触发条件：第 2 次请求触发公共前缀检测**（第 1 次请求结束时落盘，第 2 次命中）
 
 ### 问题 2：预热逻辑与 3w token 未命中
 
@@ -359,14 +379,212 @@ interface UsageStats {
 | 自然增长区 | 及时压缩 + 回滚 | 输入 cache miss → 减少 miss 量 |
 | 输出层 | caveman / prompt 压缩 | 输出 token（最贵项） |
 
+### 并发 subagent 缓存策略
+
+**问题：** 高并发调用 subagent 时，如何保持缓存命中？
+
+**结论：在永久冻结区和暂时冻结区充分就绪后，可安全进行并发工作。**
+
+```
+请求结构 = [shared prefix] + [task context] + [task instruction]
+              ↑ 缓存命中区       ↑ 每个不同       ↑ 每个不同
+              (~256 token)       (cache miss)     (cache miss)
+```
+
+**实践方案：预热-就绪-并发（Warm-Ready-Concurrent）**
+
+本方案是"低价值丢弃"策略的正向应用：先将高价值内容沉淀到冻结区，再并发执行低价值的探索性工作。
+
+```
+Phase 1 — 就绪 (Sequential, 单线程)
+  ├── 构建永久冻结区: system prompt + 项目文档 + 技能索引
+  ├── 构建暂时冻结区: 任务相关的上下文（已读取的文件、已确认的设计）
+  ├── 预热请求: 发 1 个请求验证缓存就绪
+  └── 回滚低价值内容: 移除未贡献缓存命中的临时操作
+
+Phase 2 — 并发 (Parallel, 多线程)
+  ├── 每个 subagent 请求 = 冻结区(prefix) + task context + task instruction
+  ├── 冻结区部分 → 全部命中缓存
+  ├── task context 部分 → cache miss（不可避免，但占比小）
+  └── 收集结果 → 判定高/低价值 → 高价值 append 入暂时冻结区
+
+Phase 3 — 收敛 (Sequential, 单线程)
+  ├── 合并所有 subagent 结果
+  ├── 低价值操作回滚（不进入下一轮冻结区）
+  ├── 高价值内容沉淀入暂时冻结区
+  └── 为下一轮并发更新 shared prefix
+```
+
+**与低价值丢弃的关系：**
+
+| 阶段 | 低价值丢弃的作用 |
+| :--- | :--- |
+| Phase 1 就绪 | 回滚探索性操作，确保冻结区只含高价值内容 |
+| Phase 2 并发 | 每个 subagent 的 task context 是一次性的，天然低价值 |
+| Phase 3 收敛 | 丢弃 subagent 的低价值输出，只保留高价值结论沉淀 |
+
+**关键约束：**
+- 冻结区必须 ≥128 token 才能触发缓存
+- 预热请求必须在并发请求之前完成（缓存构建是秒级）
+- 并发 subagent 的 shared prefix 必须完全一致（一字不差）
+- task context 的差异不影响 shared prefix 的缓存命中
+
+**实测数据（5 并发）：**
+
+| 策略 | hit_rate | cost | 节省 |
+| :--- | :--- | :--- | :--- |
+| 无预热 | 0% | $0.000258 | — |
+| 1 次预热 | 95.5% | $0.000082 | 68% |
+| 分波 (Wave1 自然构建) | 94~97% | $0.000083 | 68% |
+
+### 应用场景：Parallel Fork 模式
+
+**场景描述：** 用户在对话中逐步构建上下文（阅读代码、确认设计），当判断上下文充足后，主动开启 parallel 模式。此后用户的每次任务可被拆分为多个并行 agent，每个 agent 从当前 context fork 一份后独立执行。
+
+**交互流程：**
+
+```
+用户: 读一下 leveldefine_xzmp.ts
+Agent: [读取文件，分析结构，回复摘要]     ← Sequential，构建上下文
+用户: 再看看 cmmonthcard_xzmp.ts
+Agent: [读取文件，分析结构，回复摘要]     ← Sequential，继续构建
+用户: 对比这两个模块的数据存储差异
+Agent: [分析对比，回复结论]               ← Sequential，上下文已丰富
+
+用户: /parallel on                        ← 用户判断上下文充足，开启并行模式
+
+用户: 同时做三件事：
+  1. 为 leveldefine 写接口文档
+  2. 为 cmmonthcard 写接口文档
+  3. 对比两个模块的降级策略差异
+
+Agent: [Fork context × 3, 并发执行]
+  ├── Agent-1: context_fork + "写 leveldefine 接口文档"
+  ├── Agent-2: context_fork + "写 cmmonthcard 接口文档"
+  └── Agent-3: context_fork + "对比降级策略"
+  [收集结果，合并回复]
+```
+
+**Context Fork 机制：**
+
+```
+主 context (用户对话累积)
+  ├── 永久冻结区: system prompt + 项目文档       ← fork 时复制
+  ├── 暂时冻结区: 已读取的文件 + 已确认的设计    ← fork 时复制
+  └── 自然增长区: 对话历史 + 工具调用结果        ← fork 时复制
+
+Fork-1 (Agent-1 的独立 context)
+  ├── [继承] 永久冻结区 (不变)
+  ├── [继承] 暂时冻结区 (不变)
+  ├── [继承] 自然增长区 (作为只读参考)
+  └── [新增] Agent-1 的任务上下文 + 工具调用结果
+
+Fork-2, Fork-3 ... 同理
+```
+
+**缓存对齐：**
+
+| 阶段 | 操作 | 缓存效果 |
+| :--- | :--- | :--- |
+| Sequential 积累 | 用户对话 + 工具调用 | 永久冻结区 + 暂时冻结区逐步构建，缓存命中率逐步提升 |
+| /parallel on | 用户显式开启 | 此时 shared prefix 已充分就绪，缓存已热 |
+| Fork 并发 | N 个 agent 从 context fork | 每个 fork 共享同一 prefix → 全部命中缓存 |
+| 结果收敛 | 合并 N 个 agent 的输出 | 高价值内容 append 入暂时冻结区，低价值丢弃 |
+
+**与低价值丢弃的关系：**
+
+- Sequential 阶段：用户通过对话逐步筛选高价值上下文，低价值的中间探索被自然淘汰
+- Parallel 阶段：每个 fork 的 task context 是一次性的（低价值），冻结区是高价值的
+- 收敛阶段：agent 输出中的低价值内容（调试日志、中间推理）被丢弃，高价值结论沉淀入暂时冻结区
+
+**设计约束：**
+
+| 约束 | 说明 |
+| :--- | :--- |
+| 用户显式开启 | 不自动判断，避免误触发（上下文不足时并行效果差） |
+| fork 是快照 | fork 后主 context 冻结，各 agent 独立演化，不互相干扰 |
+| prefix 必须一致 | 所有 fork 共享同一 frozen zones，一字不差 |
+| 收敛是 append-only | agent 结果只追加到暂时冻结区末尾，不修改已有内容 |
+| /parallel off | 用户可随时关闭，回到 sequential 模式 |
+
+**预期收益（基于实测）：**
+
+```
+Sequential 模式: 3 个任务串行执行
+  总 cost = 3 × single_request_cost
+
+Parallel Fork 模式: 3 个任务并行执行
+  总 cost = warmup_cost + 3 × (prefix_hit_cost + task_miss_cost)
+  节省 ≈ 68% (基于 5 并发实测)
+```
+
 ---
 
-## 验证计划
+## 验证记录
 
-| 验证项 | 方法 | 预期结果 |
+所有验证均通过 tiny-agent (`python Poc/tiny_agent.py`) 或直接调用 DeepSeek API 完成。
+
+### 已验证项
+
+| 验证项 | 结论 | 实测数据 |
 | :--- | :--- | :--- |
-| 单请求多缓存命中 | 发送请求，检查 usage 中 hit/miss 的分布 | 单次只命中一个最长连续前缀 |
-| 预热 token 消耗 | 首次请求 vs 后续相同请求对比 | 首次全 miss，后续 system prompt 部分全 hit |
-| 回滚对缓存的影响 | 回滚末尾内容后重新请求 | hit token 数不变，miss token 数减少 |
-| 低价值判定系数 | 批量请求统计各操作的 hit/miss | 验证阈值是否合理 |
-| API 返回格式 | 实际调用 API 解析 usage 字段 | 已验证 ✅ 见问题 5 |
+| 缓存命中稳定性 | ✅ 同一 system prompt 连续 5 次请求，hit 稳定 256 token | 5 次均为 hit=256, miss=56, 82.1% |
+| 多前缀缓存数量 | ✅ 10 组不同前缀全部被缓存，最小块 128 token | 10/10 HIT，每个 hit=128 |
+| 并发缓存命中 | ✅ 1 次预热后 5 并发请求 hit_rate=95.5% | 无预热 0% → 预热后 95.5%，节省 68% |
+| Warm-Ready-Concurrent | ✅ 就绪→预热→并发→收敛的四阶段模式 | 低价值丢弃的正向应用 |
+| Parallel Fork 模式 | 设计方案，待实现 | 用户主动开启，context fork 后并发执行 |
+| 首次请求全 miss | ✅ 首次无缓存，system prompt 全量计费 | 1890 miss, 0 hit, $0.000293 |
+| 缓存后费用降低 | ✅ 第二次起 system prompt 命中缓存 | 1792 hit, 98 miss, $0.000047（降低 6.2x） |
+| 费用计算公式 | ✅ `cost = (miss×0.14 + hit×0.0028 + out×0.28) / 1M` | 手动计算与脚本输出一致 |
+| flash vs pro 对比 | ✅ 命中率相同时，pro 费用约为 flash 的 3x | flash $0.000026 vs pro $0.000080（第3次） |
+| caveman 输出压缩 | ✅ 输出 token 减少 57.6%，总费用降低 54.5% | 正常 500 out/$0.000144 vs caveman 212 out/$0.000066 |
+| 30k token 来源 | ✅ Claude Code 完整 system prompt ~1890 token，30k 来自会话累积 | system prompt 7384 chars ≈ 1890 token |
+
+### 验证细节
+
+**缓存命中稳定性（5 次连续请求）：**
+```
+第1次: prompt=312 hit=256 miss=56 out=141 cost=$0.000048
+第2次: prompt=312 hit=256 miss=56 out=85  cost=$0.000032
+第3次: prompt=312 hit=256 miss=56 out=40  cost=$0.000020
+第4次: prompt=312 hit=256 miss=56 out=71  cost=$0.000028
+第5次: prompt=312 hit=256 miss=56 out=68  cost=$0.000028
+```
+
+**caveman 输出压缩效果：**
+```
+正常模式: output=500 tokens, cost=$0.000144
+caveman:  output=212 tokens, cost=$0.000066
+输出节省: 288 tokens (57.6%)
+费用节省: $0.000079 (54.5%)
+```
+
+**flash vs pro 费用对比（210 token system prompt）：**
+```
+flash 第1次: miss=210 hit=0   out=50 cost=$0.000043
+flash 第3次: miss=82  hit=128 out=50 cost=$0.000026  (节省 40.5%)
+
+pro   第1次: miss=210 hit=0   out=50 cost=$0.000135
+pro   第3次: miss=82  hit=128 out=50 cost=$0.000080  (节省 40.9%)
+```
+
+**并发 subagent 缓存命中（5 并发，shared prefix ~256 token）：**
+
+```
+模式 1 无预热:
+  5 个并发请求全部 MISS → hit_rate=0.0%, cost=$0.000258
+
+模式 2 预热后并发:
+  1 次预热 + 5 个并发请求 → hit_rate=95.5%, cost=$0.000082 (节省 68%)
+
+模式 3 分波并发 (2 波):
+  Wave 1 (3个): hit_rate=94.3%, cost=$0.000051
+  Wave 2 (2个): hit_rate=97.2%, cost=$0.000032
+  总 cost=$0.000083
+```
+
+| 模式 | 预热 | hit_rate | cost | 相对无预热 |
+| :--- | :--- | :--- | :--- | :--- |
+| 无预热并发 | 无 | 0.0% | $0.000258 | 100% |
+| 预热后并发 | 1 次 | 95.5% | $0.000082 | 31.8% |
+| 分波并发 | 0 次（Wave1 自然构建） | 94~97% | $0.000083 | 32.2% |
