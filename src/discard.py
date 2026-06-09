@@ -85,47 +85,64 @@ class TaskValueJudge:
         self.tok = tokenizer or get_tokenizer()
 
     def assess(self, requests: List[SubRequest], context_total: int, task_description: str = "") -> TaskVerdict:
-        """判定任务价值"""
+        """
+        丢弃判定：只丢弃 "高命中率且 Miss 很小" 的任务（便宜重建）
+
+        核心逻辑反转：高命中率 = 缓存已覆盖，丢弃后重建成本极低
+                      低命中率 = 已付出大代价，保留避免重复付费
+
+        规则：
+        1. miss > 600 → 不丢弃（成本太高，留着）
+        2. miss ≤ 600 → 检查两个条件：
+           a. miss : context_total < 1:100 → 不丢弃（太小可忽略）
+           b. miss : hit < 1:15 → 不丢弃（几乎全命中）
+           c. 否则 → 丢弃（便宜可重建）
+        """
         if not requests:
             return TaskVerdict(False, "空任务", 1.0)
 
-        task_tokens = sum(r.tokens for r in requests)
         total_hit = sum(r.cache_hit for r in requests)
         total_miss = sum(r.cache_miss for r in requests)
-        total_out = sum(r.output_tokens for r in requests)
-        n = len(requests)
 
-        # 【快速通道】高输出密度 → 直接保留（即使 0 hit）
-        # 避免第一次请求就被 discard：0 hit + exploration role + 大context占比 = 低分
-        if task_tokens > 0:
-            output_density = total_out / task_tokens
-            if output_density >= 0.20:  # >20% 产出率 = 有意义的工作
-                return TaskVerdict(False, f"高产出率 {output_density:.1%}, 保留", 0.60)
+        # 规则 1: miss 太大 → 不丢弃
+        if total_miss > 600:
+            return TaskVerdict(False, f"miss={total_miss} > 600, 保留避免重付", 0.0)
 
-        # 5 维度评分
-        s1 = self._score_cache_contrib(total_hit, total_miss)
-        s2 = self._score_context_ratio(task_tokens, context_total)
-        s3 = self._score_output_density(total_out, task_tokens)
-        s4 = self._score_chain_depth(n)
-        s5 = self._score_role_mix(requests)
+        # 规则 1a: hit=0 → 全 miss，刚付全款 → 绝对不丢弃
+        if total_hit == 0:
+            return TaskVerdict(False, f"hit=0 (全 miss), 刚付全款不丢弃", 0.0)
 
-        score = (
-            s1 * self.config.w_cache_contrib
-            + s2 * self.config.w_context_ratio
-            + s3 * self.config.w_output_density
-            + s4 * self.config.w_chain_depth
-            + s5 * self.config.w_role_mix
-        )
-
-        # 判定
-        if score >= self.config.score_threshold_high:
-            return TaskVerdict(False, f"高价值 (score={score:.2f})", score)
-        elif score < self.config.score_threshold_low:
+        # 规则 2a: miss 占比太小 → 丢弃（影响可忽略）
+        if context_total > 0 and total_miss / context_total < 0.01:  # <1%
+            task_tokens = total_hit + total_miss
+            total_out = sum(r.output_tokens for r in requests)
             high_reqs = self._extract_high_value(requests, task_tokens)
             summary = self._generate_summary(requests, task_description, task_tokens, total_hit, total_miss)
-            return TaskVerdict(True, f"低价值 (score={score:.2f})", score, high_value_requests=high_reqs, summary=summary)
-        else:
-            return TaskVerdict(False, f"可疑 (score={score:.2f}), 保留观察", score)
+            return TaskVerdict(
+                True,
+                f"miss/context={total_miss}/{context_total} < 1%, 影响可忽略",
+                0.1,
+                high_value_requests=high_reqs,
+                summary=summary,
+            )
+
+        # 规则 2b: miss : hit ≤ 1:20 → 丢弃（命中率≥95%，重建极便宜）
+        if total_miss / total_hit <= 1/15:  # ≥95% 命中率
+            task_tokens = sum(r.tokens for r in requests)
+            total_out = sum(r.output_tokens for r in requests)
+            high_reqs = self._extract_high_value(requests, task_tokens)
+            summary = self._generate_summary(requests, task_description, task_tokens, total_hit, total_miss)
+            return TaskVerdict(
+                True,
+                f"miss/hit={total_miss}/{total_hit} < 1:15, 命中率 {total_hit/(total_hit+total_miss)*100:.1f}%, 重建极便宜",
+                0.1,
+                high_value_requests=high_reqs,
+                summary=summary,
+            )
+
+        # 否则 → 保留（命中率不够高，重建成本不低）
+        hit_rate = total_hit / (total_hit + total_miss) * 100 if (total_hit + total_miss) > 0 else 0
+        return TaskVerdict(False, f"命中率 {hit_rate:.0f}%，保留避免重建", 0.5)
 
     def _score_cache_contrib(self, total_hit: int, total_miss: int) -> float:
         """缓存贡献率 → [0, 1]"""

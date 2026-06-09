@@ -255,6 +255,19 @@ class AgentLoop(BaseAgentLoop):
 
         print(f"  {self.task_judge.explain(verdict)}")
 
+        # 展示上下文用量
+        print(f"\n  ┌{'─' * 56}┐")
+        print(f"  │  Context Usage{' ' * 46}│")
+        print(f"  ├{'─' * 56}┤")
+        print(f"  │  Permanent:  {analysis.permanent.tokens:5d} tokens  ({analysis.permanent.message_count:2d} msgs){' ' * 22}│")
+        print(f"  │  Temporary:  {analysis.temporary.tokens:5d} tokens  ({analysis.temporary.message_count:2d} msgs){' ' * 22}│")
+        print(f"  │  Natural:    {analysis.natural.tokens:5d} tokens  ({analysis.natural.message_count:2d} msgs){' ' * 22}│")
+        print(f"  ├{'─' * 56}┤")
+        print(f"  │  Total:      {analysis.total_tokens:5d} tokens{' ' * 36}│")
+        print(f"  │  Hit Rate:   {analysis.hit_rate:5.1f}%{' ' * 40}│")
+        print(f"  │  Est. Cost:  ${analysis.cost_estimate_with_cache:.6f}{' ' * 33}│")
+        print(f"  └{'─' * 56}┘")
+
         if not verdict.is_low_value or not self.config.discard.auto_discard:
             return
 
