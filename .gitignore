@@ -2,3 +2,7 @@
 CPP-GAMESVR-DEV
 CP-DEV
 .env
+.traces
+__pycache__
+Temp
+.*

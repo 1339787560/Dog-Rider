@@ -520,6 +520,250 @@ Parallel Fork 模式: 3 个任务并行执行
 
 ---
 
+## 分词器逆向
+
+### Tokenizer 获取
+
+DeepSeek V3/V4 使用 **Tiktoken-based BPE** 分词器，直接从 HuggingFace 获取：
+
+```python
+# 下载
+# https://huggingface.co/deepseek-ai/DeepSeek-V3/resolve/main/tokenizer.json
+# 文件大小: ~7.8MB, 缓存至 Poc/.cache/tokenizer.json
+
+from tokenizers import Tokenizer
+tok = Tokenizer.from_file("Poc/.cache/tokenizer.json")
+```
+
+| 属性 | 值 |
+| :--- | :--- |
+| Vocab 大小 | 128,815 |
+| 分词算法 | BPE (Byte-Pair Encoding) |
+| 基础词表 | Tiktoken (cl100k_base 兼容) |
+| 缓存粒度 | 128 token |
+| Chat template 开销 | base 4 token + 每条消息 2 token (n>2) |
+
+### Chat Template 开销公式
+
+本地 token 计数 vs API `prompt_tokens` 的关系：
+
+```
+API prompt_tokens = sum(local_content_tokens) + overhead
+
+overhead = 4                       (n_messages ≤ 2)
+overhead = 4 + 2 × (n_messages - 2)  (n_messages > 2)
+```
+
+**实测验证：**
+
+| 消息结构 | local | api | overhead | 公式 |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 user | 1 | 5 | 4 | 4 |
+| sys + user | 2 | 6 | 4 | 4 |
+| sys + user + asst + user | 4 | 12 | 8 | 4 + 2×2 |
+| sys + ... + user (6 msgs) | 6 | 18 | 12 | 4 + 2×4 |
+| 10 user | 10 | 23 | 13 | ~4 + 2×5 |
+
+**关键结论：**
+- 本地 token 计数精确匹配 API 返回的 `prompt_cache_hit_tokens`（不含 template 开销）
+- Template 开销仅影响 `prompt_tokens` 总数，不影响缓存命中计算
+- 三区模型的 token 分析基于本地计数即可，无需 API 往返
+
+### 128 Token 缓存边界验证
+
+| system prompt | 第 1 次 miss | 第 2 次 hit | 缓存？ |
+| :--- | :--- | :--- | :--- |
+| 68 token | 73 | 0 | ❌ |
+| 90 token | 95 | 0 | ❌ |
+| 128 token | 133 | **128** | ✅ |
+| 132 token | 9 | **128** | ✅ |
+| 173 token | 50 | **128** | ✅ |
+| 258 token | 135 | **256** | ✅ |
+| 256 token | 5 | **256** | ✅ |
+
+**结论：**
+- 缓存命中值总是 128 的整数倍
+- `< 128 token` 的前缀不会被缓存
+- 永久冻结区必须 ≥ 128 token 才能触发缓存
+- 本地 `count(text)` = API `prompt_cache_hit_tokens`（对前缀部分）
+
+### ContextAnalyzer 类
+
+`Poc/tokenizer_poc.py` 提供三个核心类：
+
+```python
+from tokenizer_poc import DeepSeekTokenizer, ContextAnalyzer, ValueJudge, TemplateEstimator
+
+# 1. 分词器
+tok = DeepSeekTokenizer()
+tok.count("hello world")          # → 2
+tok.common_prefix_len(a, b)       # → 公共前缀 token 数
+tok.cache_hit_tokens(200)         # → 128 (128 对齐)
+tok.estimate_cache_hit(prefix, full_input)  # → (hit, miss)
+
+# 2. 三区分析器
+analyzer = ContextAnalyzer(tok)
+analyzer.set_zone("permanent", system_prompt)
+analyzer.set_zone("temporary", read_files_summary)
+analyzer.set_zone("natural", current_task)
+print(analyzer.report())          # → 完整分析报告
+
+# 3. 低价值判定
+judge = ValueJudge(tok)
+is_low, reason = judge.judge(op_tokens=200, cache_hit=10, cache_miss=190, context_total=500)
+# → (True, "极高 miss 率 (95.0%)")
+
+# 4. Template 开销估算
+api_estimate = TemplateEstimator.estimate(messages, content_tokens)
+content_estimate = TemplateEstimator.content_tokens_from_api(api_prompt_tokens, n_messages)
+```
+
+### 用法
+
+```bash
+python Poc/tokenizer_poc.py --local     # 纯本地分析 (不需要 API key)
+python Poc/tokenizer_poc.py --verify    # 验证本地 vs API 计数
+python Poc/tokenizer_poc.py             # 全量分析
+```
+
+---
+
+## 任务级价值判定
+
+### 设计目标
+
+从"单次操作判定"扩展到"任务级判定"——任务是由多个 API 请求组成的合集（agent loop），在任务自然结束（finish_reason ≠ tool_calls）后判定整条任务的价值，决定保留或丢弃。
+
+### 任务生命周期
+
+```
+Task 开始 (用户发送消息)
+  │
+  ├── Request 1: chat 调用        → hit/miss 记录
+  ├── Request 2: tool 调用        → hit/miss 记录
+  ├── Request 3: chat (分析结果)  → hit/miss 记录
+  ├── ...
+  └── Request N: finish_reason ≠ tool_calls  → 任务自然结束
+                                                    │
+                                          TaskValueJudge.assess()
+                                                    │
+                                    ┌───────────────┴───────────────┐
+                                    ↓                               ↓
+                                KEEP                             DISCARD
+                          整任务保留在                     提取高价值子请求
+                          自然增长区                       + 生成任务摘要
+                                                                ↓
+                                                         压缩后 append
+                                                         到共享 context
+```
+
+### 子请求角色分类
+
+每个子请求按语义角色标记：
+
+| 角色 | 标记 | 默认价值 | 示例 |
+| :--- | :--- | :--- | :--- |
+| exploration | 探索 | 低 | grep, find, ls, glob |
+| read | 读取 | 中 | read file, cat |
+| analyze | 分析 | 高 | chat 无 tool call |
+| output | 输出 | 高 | 最终回复、结论 |
+| write | 写入 | 高 | write/edit file |
+
+### 5 维度评分模型
+
+```
+任务价值 score = Σ(维度得分 × 权重)
+
+维度:
+  1. 缓存贡献率  (W=0.30): hit/(hit+miss),  >50% → 满分
+  2. 上下文占比  (W=0.20): task/context,     >30% → 0分 (反向)
+  3. 输出密度    (W=0.20): output/task,      >30% → 满分
+  4. 请求链深度  (W=0.15): request_count,    ≥3   → 满分
+  5. 角色分布    (W=0.15): 是否有 analyze/output/write
+```
+
+### 判定阈值
+
+| 区间 | 判定 | 行为 |
+| :--- | :--- | :--- |
+| score ≥ 0.65 | 高价值 | 整任务保留在自然增长区 |
+| 0.35 ≤ score < 0.65 | 可疑 | 保留但标记，观察后续 |
+| score < 0.35 | 低价值 | 丢弃，提取高价值子请求 + 生成摘要 |
+
+### 高价值子请求提取
+
+低价值任务中可能包含高价值信息。丢弃时按优先级提取：
+
+```
+提取优先级:
+  1. ROLE_OUTPUT  → 任务结论，必须保留
+  2. ROLE_ANALYZE → 分析过程，包含推理
+  3. ROLE_WRITE   → 代码产出，有持久价值
+  4. 高缓存命中   → 复用价值高
+
+限制: 提取总量 ≤ MAX_EXTRACT_TOKENS (默认 500)
+```
+
+### 任务摘要
+
+丢弃后生成压缩摘要替代原任务内容，append 到共享 context：
+
+```
+[DISCARDED TASK] 探索任务: grep 搜索 + 读文件
+  requests=4 tokens=850 hit_rate=1.2%
+  roles: analyze=1, exploration=1, read=2
+```
+
+### 实测演示
+
+```bash
+python Poc/tokenizer_poc.py --task
+```
+
+| 场景 | requests | tokens | hit_rate | score | 判定 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 探索 grep + 读文件 | 4 | 850 | 1.2% | 0.34 | ✗ DISCARD |
+| 深度分析 + 写文档 | 4 | 520 | 48.1% | 0.77 | ✓ KEEP |
+| 快速查询 | 1 | 30 | 66.7% | 0.83 | ✓ KEEP |
+| 纯探索 (grep/ls) | 4 | 650 | 0.0% | 0.16 | ✗ DISCARD |
+| 读 → 分析 → 写代码 | 4 | 360 | 58.3% | 0.80 | ✓ KEEP |
+
+### 配置可调
+
+`TaskValueJudge.Config` 类中所有参数可通过 yaml/json 覆盖：
+
+```python
+class Config:
+    SCORE_THRESHOLD_LOW  = 0.35   # 低于此值 → 丢弃
+    SCORE_THRESHOLD_HIGH = 0.65   # 高于此值 → 保留
+    W_CACHE_CONTRIB  = 0.30       # 缓存贡献权重
+    W_CONTEXT_RATIO  = 0.20       # 上下文占比权重
+    W_OUTPUT_DENSITY = 0.20       # 输出密度权重
+    W_CHAIN_DEPTH    = 0.15       # 请求链深度权重
+    W_ROLE_MIX       = 0.15       # 角色分布权重
+    MAX_EXTRACT_TOKENS = 500      # 提取上限
+```
+
+### 与三区模型的集成
+
+```
+自然增长区末尾 = 当前任务 (N 个请求)
+
+TaskValueJudge.assess() → DISCARD
+  ↓
+1. 提取高价值子请求 → 保留在自然增长区 (压缩后)
+2. 生成任务摘要 → 追加到自然增长区
+3. 原始请求链 → 从上下文中移除
+4. 永久冻结区 + 暂时冻结区 → 不变，缓存命中不受影响
+
+TaskValueJudge.assess() → KEEP
+  ↓
+1. 整任务保留在自然增长区
+2. 后续可被 ContextManager 压缩到暂时冻结区
+```
+
+---
+
 ## 验证记录
 
 所有验证均通过 tiny-agent (`python Poc/tiny_agent.py`) 或直接调用 DeepSeek API 完成。
