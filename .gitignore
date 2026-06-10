@@ -6,3 +6,4 @@ CP-DEV
 __pycache__
 Temp
 .*
+*.txt
