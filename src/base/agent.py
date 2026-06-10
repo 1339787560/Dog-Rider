@@ -117,9 +117,13 @@ class BaseAgentLoop:
             try:
                 result = self._call_api(self.context.messages)
             except Exception as e:
-                err_msg = f"(Agent loop terminated: API call failed after retries: {e})"
-                print(f"\n{err_msg}", file=sys.stderr)
-                return err_msg
+                # 注入错误消息让 LLM 感知，继续循环
+                self.context.append({
+                    "role": "system",
+                    "content": f"[ERROR] API call failed after {self.config.max_retries} retries: {e}. "
+                               f"Please continue with what you know, or try a different approach.",
+                })
+                continue
 
             # ── 解析响应 ──
             try:
@@ -127,9 +131,12 @@ class BaseAgentLoop:
                 message = choice["message"]
                 finish_reason = choice.get("finish_reason")
             except (KeyError, IndexError, TypeError) as e:
-                err_msg = f"(Agent loop error: unexpected API response structure: {e})"
-                print(f"\n{err_msg}", file=sys.stderr)
-                return err_msg
+                self.context.append({
+                    "role": "system",
+                    "content": f"[ERROR] Unexpected API response structure: {e}. "
+                               f"Please continue with what you know.",
+                })
+                continue
 
             # ── 工具调用轮次 ──
             if finish_reason == "tool_calls" and message.get("tool_calls"):
@@ -168,10 +175,19 @@ class BaseAgentLoop:
             self.context.append(message)
             return content
 
-        # 达到 max_turns 上限
-        err_msg = f"(Agent loop stopped: reached max_turns={self.config.max_turns})"
-        print(f"\n{err_msg}", file=sys.stderr)
-        return err_msg
+        # 达到 max_turns 上限 — 注入错误，给 LLM 最后回应机会
+        self.context.append({
+            "role": "system",
+            "content": f"[ERROR] Reached max_turns={self.config.max_turns}. "
+                       f"Please provide your final answer now based on what you have so far.",
+        })
+        try:
+            result = self._call_api(self.context.messages)
+            content = result["choices"][0]["message"].get("content", "")
+            self.context.append(result["choices"][0]["message"])
+            return content
+        except Exception:
+            return f"(Agent loop stopped: reached max_turns={self.config.max_turns})"
 
     def reset(self):
         """重置对话，保留 system prompt"""

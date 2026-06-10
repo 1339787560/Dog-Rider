@@ -170,10 +170,13 @@ class AgentLoop(BaseAgentLoop):
             try:
                 result = self._call_api(working.messages)
             except Exception as e:
-                err_msg = f"(Task terminated: API call failed after retries: {e})"
-                print(f"\n  {err_msg}")
-                self._handle_task_end(user_input, working)
-                return err_msg
+                # 注入错误消息让 LLM 感知，继续循环
+                working.append({
+                    "role": "system",
+                    "content": f"[ERROR] API call failed after {self.config.max_retries} retries: {e}. "
+                               f"Please continue with what you know, or try a different approach.",
+                })
+                continue
 
             # ── 解析响应 ──
             try:
@@ -181,10 +184,12 @@ class AgentLoop(BaseAgentLoop):
                 message = choice["message"]
                 finish = choice["finish_reason"]
             except (KeyError, IndexError, TypeError) as e:
-                err_msg = f"(Task terminated: unexpected API response: {e})"
-                print(f"\n  {err_msg}")
-                self._handle_task_end(user_input, working)
-                return err_msg
+                working.append({
+                    "role": "system",
+                    "content": f"[ERROR] Unexpected API response structure: {e}. "
+                               f"Please continue with what you know.",
+                })
+                continue
 
             usage = result.get("usage", {})
             h = usage.get("prompt_cache_hit_tokens", 0)
@@ -259,11 +264,20 @@ class AgentLoop(BaseAgentLoop):
 
             return content
 
-        # 达到 max_turns 上限
-        err_msg = f"(Task stopped: reached max_turns={self.config.max_turns})"
-        print(f"\n  {err_msg}")
+        # 达到 max_turns 上限 — 注入错误，给 LLM 最后回应机会
+        working.append({
+            "role": "system",
+            "content": f"[ERROR] Reached max_turns={self.config.max_turns}. "
+                       f"Please provide your final answer now based on what you have so far.",
+        })
+        try:
+            result = self._call_api(working.messages)
+            content = result["choices"][0]["message"].get("content", "")
+            working.append(result["choices"][0]["message"])
+        except Exception:
+            content = f"(Task stopped: reached max_turns={self.config.max_turns})"
         self._handle_task_end(user_input, working)
-        return err_msg
+        return content
 
     def _handle_task_end(self, task_description: str, working: ContextManager):
         """任务结束：价值判定 + 合并决策。
