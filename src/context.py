@@ -55,8 +55,33 @@ class ContextManager:
         """批量追加消息"""
         self.messages.extend(messages)
 
+    def snapshot(self) -> "ContextManager":
+        """创建独立副本用于隔离任务执行。
+
+        深拷贝 messages 列表，共享 config 和 tokenizer 引用。
+        副本的修改不影响原始上下文。
+        """
+        clone = ContextManager(self.config, self.tok)
+        clone.messages = [dict(m) for m in self.messages]
+        return clone
+
+    def replace_with(self, other: "ContextManager"):
+        """用另一个上下文的副本替换当前消息列表 (KEEP 判定)。"""
+        self.messages = [dict(m) for m in other.messages]
+
+    def merge_extracted(self, working: "ContextManager",
+                        extracted_messages: List[dict], summary: str = ""):
+        """从工作副本中合并提取的高价值消息 (PARTIAL 判定)。"""
+        if summary:
+            self.messages.append({"role": "system", "content": f"[PARTIAL KEEP] {summary}"})
+        for m in extracted_messages:
+            self.messages.append(dict(m))
+
     def pop_natural(self, n: int) -> List[dict]:
-        """从自然增长区末尾弹出 n 条消息"""
+        """[DEPRECATED] 从自然增长区末尾弹出 n 条消息。
+
+        已被 snapshot + merge 模式替代，保留用于向后兼容。
+        """
         start = self.config.context.natural_zone_start
         if len(self.messages) <= start:
             return []

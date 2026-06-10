@@ -22,6 +22,8 @@ class SubRequest:
     cache_miss: int = 0
     output_tokens: int = 0
     label: str = ""
+    msg_start: int = -1
+    msg_end: int = -1
 
     @property
     def miss_rate(self) -> float:

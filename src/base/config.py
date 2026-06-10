@@ -22,6 +22,8 @@ class BaseConfig:
     """基础 Agent 配置 - 仅包含最小功能集"""
     model: ModelConfig = field(default_factory=ModelConfig)
     verbose: bool = False
+    max_turns: int = 50        # 单任务最大对话轮次
+    max_retries: int = 3       # API 调用失败最大重试次数
 
     @classmethod
     def from_env(cls) -> "BaseConfig":

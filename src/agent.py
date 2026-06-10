@@ -76,6 +76,7 @@ class AgentLoop(BaseAgentLoop):
         self.task_judge = TaskValueJudge(config)
         self.current_task_requests: List[SubRequest] = []
         self.last_verdict: Optional[TaskVerdict] = None
+        self._pending_discard_hint: str = ""  # 下次任务注入的低价值标记
 
     def _call_api(self, messages: List[dict]) -> dict:
         """调用 DeepSeek API - 扩展缓存统计"""
@@ -127,8 +128,9 @@ class AgentLoop(BaseAgentLoop):
 
         return result
 
-    def _record_subrequest(self, role: str, usage: dict, label: str = ""):
-        """记录子请求"""
+    def _record_subrequest(self, role: str, usage: dict, label: str = "",
+                           msg_start: int = -1, msg_end: int = -1):
+        """记录子请求 — 含消息范围以便后续提取"""
         p = usage.get("prompt_tokens", 0)
         h = usage.get("prompt_cache_hit_tokens", 0)
         m = usage.get("prompt_cache_miss_tokens", p)
@@ -141,27 +143,48 @@ class AgentLoop(BaseAgentLoop):
             cache_miss=m,
             output_tokens=o,
             label=label,
+            msg_start=msg_start,
+            msg_end=msg_end,
         )
         self.current_task_requests.append(req)
 
     def run_task(self, user_input: str) -> str:
-        """执行一个任务 (用户输入 → agent loop 自然结束)
+        """执行任务 — 健壮循环，在独立快照上运行，结束后选择性合并。
 
-        结束后自动触发价值判定和丢弃。
+        snapshot → append user → agent loop → verdict → merge/discard
         """
         self.current_task_requests = []
-        self.context.append({"role": "user", "content": user_input})
 
-        start_natural = len(self.context.messages)
+        # 注入上次丢弃标记（如果有）
+        if self._pending_discard_hint:
+            user_input = f"{self._pending_discard_hint}\n\n---\n\n{user_input}"
+            self._pending_discard_hint = ""
 
-        turn = 0
-        while True:
-            turn += 1
+        # 创建隔离工作副本
+        working = self.context.snapshot()
+        working.append({"role": "user", "content": user_input})
+
+        for turn in range(1, self.config.max_turns + 1):
+            # ── API 调用 ──
             print(f"  [T{turn}] Calling API...", end="", flush=True)
-            result = self._call_api(self.context.messages)
-            choice = result["choices"][0]
-            message = choice["message"]
-            finish = choice["finish_reason"]
+            try:
+                result = self._call_api(working.messages)
+            except Exception as e:
+                err_msg = f"(Task terminated: API call failed after retries: {e})"
+                print(f"\n  {err_msg}")
+                self._handle_task_end(user_input, working)
+                return err_msg
+
+            # ── 解析响应 ──
+            try:
+                choice = result["choices"][0]
+                message = choice["message"]
+                finish = choice["finish_reason"]
+            except (KeyError, IndexError, TypeError) as e:
+                err_msg = f"(Task terminated: unexpected API response: {e})"
+                print(f"\n  {err_msg}")
+                self._handle_task_end(user_input, working)
+                return err_msg
 
             usage = result.get("usage", {})
             h = usage.get("prompt_cache_hit_tokens", 0)
@@ -174,40 +197,60 @@ class AgentLoop(BaseAgentLoop):
             print(f" hit={h:4d} miss={m:4d} [{hit_bar}{miss_bar}] {hit_rate:5.1f}%")
 
             if finish == "tool_calls" and message.get("tool_calls"):
-                # 工具调用轮次
+                # 工具调用轮次 — 记录消息范围
+                msg_start = len(working.messages)
                 tool_names = [tc["function"]["name"] for tc in message["tool_calls"]]
                 role = detect_role_from_tool_name(tool_names[0]) if tool_names else "analyze"
-                self._record_subrequest(role, usage, f"tool: {', '.join(tool_names)}")
 
-                self.context.append(message)
+                working.append(message)
 
                 # 执行所有工具调用
                 for tc in message["tool_calls"]:
                     fn_name = tc["function"]["name"]
-                    args = json.loads(tc["function"]["arguments"])
-                    handler = get_tool_handler(fn_name)
+                    fn_id = tc.get("id", f"call_{turn}")
 
-                    print(f"\n  $ {fn_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in args.items())})", end="", flush=True)
+                    # 解析参数 — 失败不崩溃
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        tool_output = f"(error: failed to parse arguments for '{fn_name}': {e})"
+                        working.append({
+                            "role": "tool",
+                            "tool_call_id": fn_id,
+                            "content": tool_output,
+                        })
+                        continue
+
+                    handler = get_tool_handler(fn_name)
+                    print(f"\n  $ {fn_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in args.items())})",
+                          end="", flush=True)
 
                     if handler:
-                        tool_output = handler(**args)
+                        try:
+                            tool_output = handler(**args)
+                        except Exception as e:
+                            tool_output = f"(tool error: {e})"
                     else:
                         tool_output = f"(unknown tool: {fn_name})"
 
-                    self.context.append({
+                    working.append({
                         "role": "tool",
-                        "tool_call_id": tc["id"],
+                        "tool_call_id": fn_id,
                         "content": tool_output,
                     })
+                msg_end = len(working.messages)
+                self._record_subrequest(role, usage, f"tool: {', '.join(tool_names)}",
+                                       msg_start=msg_start, msg_end=msg_end)
                 continue
 
-            # 最终回复
+            # ── 最终回复 ──
             content = message.get("content", "")
-            self._record_subrequest("output", usage, "final reply")
-            self.context.append(message)
+            msg_start = len(working.messages)
+            working.append(message)
+            self._record_subrequest("output", usage, "final reply",
+                                   msg_start=msg_start, msg_end=len(working.messages))
 
-            # 任务结束，触发价值判定
-            self._handle_task_end(user_input, start_natural)
+            self._handle_task_end(user_input, working)
 
             if self.config.verbose:
                 print(f"\n  [usage] hit={usage.get('prompt_cache_hit_tokens', 0)} "
@@ -216,12 +259,22 @@ class AgentLoop(BaseAgentLoop):
 
             return content
 
-    def _handle_task_end(self, task_description: str, start_natural: int):
-        """任务结束处理：价值判定 + 丢弃执行 + 命中分析"""
-        analysis = self.context.analyze()
+        # 达到 max_turns 上限
+        err_msg = f"(Task stopped: reached max_turns={self.config.max_turns})"
+        print(f"\n  {err_msg}")
+        self._handle_task_end(user_input, working)
+        return err_msg
+
+    def _handle_task_end(self, task_description: str, working: ContextManager):
+        """任务结束：价值判定 + 合并决策。
+
+        KEEP    → working 替换 self.context
+        DISCARD → working 丢弃，self.context 不变
+        PARTIAL → 提取高价值消息合并入 self.context
+        """
+        analysis = working.analyze()
         context_total = analysis.total_tokens
 
-        # 提前判定价值（用于在趋势表中显示）
         verdict = self.task_judge.assess(
             self.current_task_requests,
             context_total,
@@ -231,7 +284,7 @@ class AgentLoop(BaseAgentLoop):
         will_discard = verdict.is_low_value and self.config.discard.auto_discard
         discard_label = "✓ DISCARD" if will_discard else "- KEEP"
 
-        # 任务命中趋势分析
+        # ── 任务命中趋势分析 ──
         if self.current_task_requests:
             hits = [r.cache_hit for r in self.current_task_requests]
             misses = [r.cache_miss for r in self.current_task_requests]
@@ -255,7 +308,7 @@ class AgentLoop(BaseAgentLoop):
 
         print(f"  {self.task_judge.explain(verdict)}")
 
-        # 展示上下文用量
+        # ── 上下文用量 ──
         print(f"\n  ┌{'─' * 56}┐")
         print(f"  │  Context Usage{' ' * 46}│")
         print(f"  ├{'─' * 56}┤")
@@ -268,36 +321,55 @@ class AgentLoop(BaseAgentLoop):
         print(f"  │  Est. Cost:  ${analysis.cost_estimate_with_cache:.6f}{' ' * 33}│")
         print(f"  └{'─' * 56}┘")
 
-        if not verdict.is_low_value or not self.config.discard.auto_discard:
+        # ── 合并决策 ──
+        if not verdict.is_low_value:
+            # KEEP: 完整替换
+            self.context.replace_with(working)
             return
 
-        # 执行丢弃
-        # 1. pop 自然增长区中属于当前任务的所有消息
-        n_to_pop = len(self.context.messages) - start_natural
-        if n_to_pop <= 0:
+        if not self.config.discard.auto_discard:
+            # dry-run 模式: 保留 working
+            self.context.replace_with(working)
             return
 
-        popped = self.context.pop_natural(n_to_pop)
-        popped_tokens = sum(self.tok.count(m.get("content", "")) for m in popped)
+        # DISCARD: 仅存标记，不修改上下文（保持前缀完整）
+        working_natural_tokens = sum(
+            self.tok.count(m.get("content", ""))
+            for m in working.get_zone_messages("natural")
+        )
 
-        # 2. 追加提取的高价值内容 + 摘要
-        if verdict.high_value_requests:
-            extracted_content = "\n".join(
-                f"[{r.role}] {r.label}"
-                for r in verdict.high_value_requests
-            )
-            self.context.append({"role": "system", "content": f"[EXTRACTED]\n{extracted_content}"})
+        # 生成低价值标记：告知模型此段已丢弃，无需重建
+        hint = (
+            f"[DISCARDED CONTEXT — low value, do NOT re-fetch or rebuild]\n"
+            f"  Task: {task_description}\n"
+            f"  Reason: {verdict.reason}\n"
+            f"  The content above was discarded. You already know it. Continue normally."
+        )
+        self._pending_discard_hint = hint
 
-        if verdict.summary:
-            self.context.append({"role": "system", "content": verdict.summary})
-
-        # 统计节省
-        new_tokens = sum(self.tok.count(m.get("content", "")) for m in self.context.get_zone_messages("natural"))
-        saved = popped_tokens - new_tokens
         self.stats.discarded_tasks += 1
-        self.stats.tokens_saved += saved
+        self.stats.tokens_saved += working_natural_tokens
+        print(f"  Discard effect: saved {working_natural_tokens} tokens (context unchanged, hint queued)")
 
-        print(f"  Discard effect: popped {n_to_pop} msgs ({popped_tokens}t) → saved {saved} tokens")
+    def _extract_messages_for_requests(self, working: ContextManager,
+                                       requests: List[SubRequest]) -> List[dict]:
+        """从工作副本中提取高价值子请求对应的消息。
+
+        使用 SubRequest.msg_start/msg_end 定位消息范围，
+        去重合并重叠区间，按索引顺序返回。
+        """
+        seen = set()
+        extracted = []
+        for req in requests:
+            start = req.msg_start
+            end = req.msg_end
+            if start < 0 or end <= start:
+                continue
+            for i in range(start, min(end, len(working.messages))):
+                if i not in seen:
+                    extracted.append(dict(working.messages[i]))
+                    seen.add(i)
+        return extracted
 
     def print_stats(self):
         """打印统计信息"""

@@ -472,7 +472,7 @@ GREP_TOOL = {
 ALL_TOOLS = [BASH_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, EDIT_FILE_TOOL, GLOB_TOOL, GREP_TOOL]
 
 TOOL_HANDLERS: Dict[str, Callable] = {
-    "bash": lambda **kwargs: _execute_bash(kwargs.get("command", "")),
+    "bash": lambda **kwargs: base_bash(kwargs.get("command", "")),
     "read_file": lambda **kwargs: _read_file(
         kwargs.get("filepath", ""),
         kwargs.get("offset", 0),

@@ -25,13 +25,18 @@ from urllib.error import HTTPError
 # ── 配置 ──────────────────────────────────────────
 
 env = {}
-with open(os.path.join(os.path.dirname(__file__), '..', '.env')) as f:
-    for line in f:
-        if '=' in line:
-            k, v = line.strip().split('=', 1)
-            env[k] = v
+env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            if '=' in line:
+                k, v = line.strip().split('=', 1)
+                env[k] = v
 
-API_KEY = env['DEEPSEEK_API_KEY']
+API_KEY = env.get('DEEPSEEK_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
+if not API_KEY:
+    print("ERROR: DEEPSEEK_API_KEY not found in .env or environment")
+    sys.exit(1)
 MODEL = 'deepseek-v4-flash'
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), 'cache_ttl_results.txt')
 
@@ -299,14 +304,17 @@ def bisect_ttl(system, low_min, high_min, base_time):
         if (high_min - low_min) < 1:
             break
 
-        log(f"    等待 {mid_min:.1f} 分钟...")
-        time.sleep(mid_min * 60)
-
-        # 重新预热（因为之前的缓存可能已过期）
-        # 不，我们应该检查当前缓存是否还活着
-        # 但缓存可能已经过期了，所以我们需要重新构建
-        # 实际上，二分法应该在同一个缓存生命周期内测试
-        # 所以我们需要在 base_time 的基础上等待
+        # 计算还需要等多久才能到达 mid_min 时刻（相对 base_time）
+        target_time = base_time + mid_min * 60
+        delta = target_time - time.time()
+        if delta > 0:
+            log(f"    等待 {delta/60:.1f} 分钟到达 T+{mid_min:.0f}min ...")
+            # 心跳: 每 30s 打进度
+            while delta > 0:
+                chunk = min(30, delta)
+                time.sleep(chunk)
+                delta -= chunk
+                log(f"      ... 还剩 {delta/60:.1f}min")
 
         elapsed_since_base = (time.time() - base_time) / 60
         hit, miss = check_cache(system)
