@@ -1,5 +1,6 @@
-"""上下文管理 - 三区模型"""
+"""上下文管理 - 三区模型 + 并行安全合并"""
 from dataclasses import dataclass, field
+import threading
 from typing import Dict, List, Optional
 
 from .config import PRICING, Config, ContextConfig
@@ -42,40 +43,75 @@ class ContextManager:
         self.config = config
         self.tok = tokenizer or get_tokenizer()
         self.messages: List[dict] = []
+        self._lock = threading.Lock()        # 并行合并锁
+        self._version: int = 0               # 上下文版本号，用于冲突检测
 
     def init_with_system(self, system_prompt: str):
         """初始化上下文 (设置永久冻结区)"""
-        self.messages = [{"role": "system", "content": system_prompt}]
+        with self._lock:
+            self.messages = [{"role": "system", "content": system_prompt}]
+            self._version = 1
 
     def append(self, message: dict):
-        """追加消息到自然增长区"""
-        self.messages.append(message)
+        """追加消息到自然增长区 — 线程安全"""
+        with self._lock:
+            self.messages.append(message)
 
     def extend(self, messages: List[dict]):
-        """批量追加消息"""
-        self.messages.extend(messages)
+        """批量追加消息 — 线程安全"""
+        with self._lock:
+            self.messages.extend(messages)
 
     def snapshot(self) -> "ContextManager":
         """创建独立副本用于隔离任务执行。
 
         深拷贝 messages 列表，共享 config 和 tokenizer 引用。
-        副本的修改不影响原始上下文。
+        副本的修改不影响原始上下文。记录基础版本号用于合并检测。
         """
-        clone = ContextManager(self.config, self.tok)
-        clone.messages = [dict(m) for m in self.messages]
+        with self._lock:
+            clone = ContextManager(self.config, self.tok)
+            clone.messages = [dict(m) for m in self.messages]
+            clone._base_version = self._version  # type: ignore — 快照专属字段
         return clone
 
     def replace_with(self, other: "ContextManager"):
-        """用另一个上下文的副本替换当前消息列表 (KEEP 判定)。"""
-        self.messages = [dict(m) for m in other.messages]
+        """[串行模式] 全量替换 — 单线程对话用。"""
+        with self._lock:
+            self.messages = [dict(m) for m in other.messages]
+            self._version += 1
 
     def merge_extracted(self, working: "ContextManager",
                         extracted_messages: List[dict], summary: str = ""):
-        """从工作副本中合并提取的高价值消息 (PARTIAL 判定)。"""
-        if summary:
-            self.messages.append({"role": "system", "content": f"[PARTIAL KEEP] {summary}"})
-        for m in extracted_messages:
-            self.messages.append(dict(m))
+        """[串行模式] 合并提取的高价值消息 (PARTIAL 判定)。"""
+        with self._lock:
+            if summary:
+                self.messages.append({"role": "system", "content": f"[PARTIAL KEEP] {summary}"})
+            for m in extracted_messages:
+                self.messages.append(dict(m))
+
+    def merge_parallel(self, working: "ContextManager") -> int:
+        """[并行模式] 线程安全追加式合并 — 只追加自然增长区的新消息。
+
+        永不覆盖已有内容，只追加。多线程并发时安全无竞态。
+
+        Args:
+            working: 任务工作副本
+
+        Returns:
+            实际追加的消息数量
+        """
+        with self._lock:
+            # 取 natural_zone_start 之后的所有消息（任务期间新增的）
+            start = self.config.context.natural_zone_start
+            new_messages = working.messages[start:]
+
+            if not new_messages:
+                return 0
+
+            # 深拷贝追加，防止引用共享
+            self.messages.extend([dict(m) for m in new_messages])
+            self._version += 1
+            return len(new_messages)
 
     def pop_natural(self, n: int) -> List[dict]:
         """[DEPRECATED] 从自然增长区末尾弹出 n 条消息。

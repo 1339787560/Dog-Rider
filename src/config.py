@@ -47,6 +47,7 @@ class DiscardConfig:
     high_value_roles: set = field(default_factory=lambda: {"output", "analyze", "write"})
     max_extract_tokens: int = 500
     auto_discard: bool = True  # True=自动pop, False=仅打印判定
+    merge_mode: str = "serial"  # "serial"=全量替换, "parallel"=仅追加
 
 
 @dataclass
@@ -93,5 +94,8 @@ def load_env_config() -> Config:
         config.discard.auto_discard = os.environ["DISCARD_AUTO"].lower() in ("1", "true", "yes")
     if "DISCARD_THRESHOLD" in os.environ:
         config.discard.score_threshold_low = float(os.environ["DISCARD_THRESHOLD"])
+    if "MERGE_MODE" in os.environ:
+        mode = os.environ["MERGE_MODE"].lower()
+        config.discard.merge_mode = mode if mode in ("serial", "parallel") else "serial"
 
     return config

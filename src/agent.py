@@ -337,13 +337,21 @@ class AgentLoop(BaseAgentLoop):
 
         # ── 合并决策 ──
         if not verdict.is_low_value:
-            # KEEP: 完整替换
-            self.context.replace_with(working)
+            # KEEP: 根据 merge_mode 选择合并策略
+            if self.config.discard.merge_mode == "parallel":
+                n = self.context.merge_parallel(working)
+                if self.config.verbose:
+                    print(f"  [Parallel merge] Appended {n} messages")
+            else:
+                self.context.replace_with(working)
             return
 
         if not self.config.discard.auto_discard:
             # dry-run 模式: 保留 working
-            self.context.replace_with(working)
+            if self.config.discard.merge_mode == "parallel":
+                self.context.merge_parallel(working)
+            else:
+                self.context.replace_with(working)
             return
 
         # DISCARD: 仅存标记，不修改上下文（保持前缀完整）
