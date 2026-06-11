@@ -42,6 +42,15 @@ RESULTS_FILE = os.path.join(os.path.dirname(__file__), 'cache_ttl_results.txt')
 
 # ── 上下文模板 ────────────────────────────────────
 
+_ENSURE_128 = (
+    " You follow industry best practices and write production-ready code. "
+    "You understand scalability, reliability, security, and maintainability. "
+    "You communicate clearly and document thoroughly. "
+    "You collaborate effectively with your team. "
+    "You stay up to date with the latest technologies and best practices. "
+    "You write clean, well-tested, and maintainable code."
+)
+
 SHORT_CTX = (
     "You are a TypeScript expert for CP server development. "
     "You use async/await with modsvr.context, Redis distributed locks, and MySQL storage. "
@@ -49,13 +58,15 @@ SHORT_CTX = (
     "You follow namespace conventions with Business, CommonFuncs, interf, TestTool."
 )
 
+SHORT_CTX_PADDED = SHORT_CTX + _ENSURE_128
+
 MEDIUM_CTX = SHORT_CTX * 2 + (
     " You understand the leveldefine module which tracks player experience "
     "through tongbao consumption, calculates player grades from levelContent config, "
     "implements degradation when players are inactive for degradeDays, "
     "and manages oneOffRewardStatusArray for claim rewards. "
     "You are familiar with cmmonthcard, goldbank, convert modules."
-)
+) + _ENSURE_128
 
 LONG_CTX = MEDIUM_CTX * 2 + (
     " You follow the Doc-Writer skill conventions for documentation. "
@@ -67,15 +78,41 @@ LONG_CTX = MEDIUM_CTX * 2 + (
 )
 
 CONTEXTS = {
-    "short": SHORT_CTX,
+    "short": SHORT_CTX_PADDED,
     "medium": MEDIUM_CTX,
     "long": LONG_CTX,
 }
 
+_SHORT_PREFIX_TPL = (
+    "You are a {role}. You use {tools}. "
+    "You implement {callbacks}. You follow {conventions}. "
+    "You understand {modules}. You write clean, documented, production-ready code. "
+    "You follow best practices for scalability, reliability, and maintainability. "
+    "You communicate clearly and collaborate effectively with your team."
+) + _ENSURE_128
+
 MULTI_PREFIXES = [
-    "You are a TypeScript expert for CP server development. You use async/await, Redis, MySQL. You implement OnPayResult, OnClientRequest, OnInternalCall. You follow Business, CommonFuncs, interf, TestTool namespaces. You understand leveldefine, cmmonthcard, goldbank modules.",
-    "You are a Python data scientist for ML pipelines. You use pandas, numpy, scikit-learn, PyTorch. You implement cross-validation, hyperparameter optimization, model deployment. You follow PEP 8 and write reproducible code with proper documentation.",
-    "You are a DevOps engineer for cloud-native infrastructure. You manage Kubernetes, Terraform, CI/CD pipelines. You implement monitoring with Prometheus, Grafana. You design disaster recovery with proper RPO and RTO targets.",
+    _SHORT_PREFIX_TPL.format(
+        role="TypeScript expert for CP server development",
+        tools="async/await, Redis distributed locks, MySQL storage",
+        callbacks="OnPayResult, OnClientRequest, OnInternalCall",
+        conventions="Business, CommonFuncs, interf, TestTool namespaces",
+        modules="leveldefine, cmmonthcard, goldbank modules",
+    ),
+    _SHORT_PREFIX_TPL.format(
+        role="Python data scientist for ML pipelines",
+        tools="pandas, numpy, scikit-learn, PyTorch",
+        callbacks="cross-validation, hyperparameter optimization, model deployment",
+        conventions="PEP 8 conventions and write reproducible code",
+        modules="classification, regression, NLP models",
+    ),
+    _SHORT_PREFIX_TPL.format(
+        role="DevOps engineer for cloud-native infrastructure",
+        tools="Kubernetes, Terraform, CI/CD pipelines",
+        callbacks="monitoring with Prometheus and Grafana",
+        conventions="GitOps principles and infrastructure as code",
+        modules="disaster recovery, auto-scaling, zero-downtime deployments",
+    ),
 ]
 
 PID_FILE = os.path.join(os.path.dirname(__file__), 'cache_ttl_daemon.pid')
@@ -358,8 +395,8 @@ def main_work():
     # 同时预热 3 个前缀
     log("  预热 3 个前缀...")
     for i, prefix in enumerate(MULTI_PREFIXES):
-        warmup(prefix, n=2)
-        log(f"  前缀 {i+1} 预热完成")
+        success = warmup(prefix, n=2)
+        log(f"  前缀 {i+1} {'缓存就绪' if success else '预热失败(太低)'}")
 
     # 同时检查 3 个前缀的缓存
     def check_all_multi():
