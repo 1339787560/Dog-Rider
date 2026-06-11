@@ -6,9 +6,13 @@
 - 缓存命中率追踪与优化
 - Claude Core Toolkit 完整工具集
 """
+import atexit
 import json
 import sys
-from dataclasses import dataclass
+import threading
+import uuid
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,13 +26,39 @@ from .tools import ALL_TOOLS, get_tool_handler, detect_role_from_tool_name
 
 @dataclass
 class DogRiderUsageStats(BaseUsageStats):
-    """扩展统计 - 增加缓存和丢弃相关指标"""
+    """扩展统计 - 增加缓存和丢弃相关指标 - 线程安全"""
     total_hit: int = 0
     total_miss: int = 0
     total_reasoning: int = 0
     total_cost: float = 0.0
     discarded_tasks: int = 0
     tokens_saved: int = 0
+    tasks_completed: int = 0
+    tasks_kept: int = 0
+
+    def __post_init__(self):
+        self._lock = threading.Lock()
+
+    def incr_requests(self, prompt: int, completion: int, hit: int, miss: int, reasoning: int, cost: float):
+        """原子增加请求统计"""
+        with self._lock:
+            self.total_prompt_tokens += prompt
+            self.total_completion_tokens += completion
+            self.total_hit += hit
+            self.total_miss += miss
+            self.total_reasoning += reasoning
+            self.total_cost += cost
+            self.requests += 1
+
+    def incr_task(self, kept: bool, saved: int = 0):
+        """原子增加任务统计"""
+        with self._lock:
+            self.tasks_completed += 1
+            if kept:
+                self.tasks_kept += 1
+            else:
+                self.discarded_tasks += 1
+                self.tokens_saved += saved
 
 
 def load_system_prompt() -> str:
@@ -77,13 +107,22 @@ class AgentLoop(BaseAgentLoop):
         self.current_task_requests: List[SubRequest] = []
         self.last_verdict: Optional[TaskVerdict] = None
         self._pending_discard_hint: str = ""  # 下次任务注入的低价值标记
+        self.session_id = str(uuid.uuid4())[:8]  # 会话ID用于持久化
+        self._created_at = datetime.now().isoformat()
+        self.silent = False  # True=不打印任务过程，仅统计
+        # 注册退出时持久化
+        atexit.register(self._persist_session)
 
     def _call_api(self, messages: List[dict]) -> dict:
         """调用 DeepSeek API - 扩展缓存统计"""
+        # 并行模式且开启冻结时，强制 temperature=0 保证确定性
+        temp = 0.0 if (self.config.discard.merge_mode == "parallel"
+                       and self.config.discard.isFrozenForParallel) else self.config.model.temperature
         body = {
             "model": self.config.model.model,
             "messages": messages,
             "max_tokens": self.config.model.max_tokens,
+            "temperature": temp,
             "tools": ALL_TOOLS,
             "tool_choice": "auto",
         }
@@ -107,7 +146,7 @@ class AgentLoop(BaseAgentLoop):
             print(f"\n[API Error {e.code}] {err_body}", file=sys.stderr)
             raise
 
-        # 扩展统计：缓存命中 + 成本
+        # 扩展统计：缓存命中 + 成本（线程安全）
         usage = result.get("usage", {})
         p = usage.get("prompt_tokens", 0)
         h = usage.get("prompt_cache_hit_tokens", 0)
@@ -115,16 +154,9 @@ class AgentLoop(BaseAgentLoop):
         o = usage.get("completion_tokens", 0)
         r = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
 
-        self.stats.total_prompt_tokens += p
-        self.stats.total_completion_tokens += o
-        self.stats.total_hit += h
-        self.stats.total_miss += m
-        self.stats.total_reasoning += r
-        self.stats.requests += 1
-
         price = PRICING.get(self.config.model.model, PRICING["deepseek-v4-flash"])
         cost = (m * price.miss + h * price.hit + o * price.output) / 1_000_000
-        self.stats.total_cost += cost
+        self.stats.incr_requests(p, o, h, m, r, cost)
 
         return result
 
@@ -166,7 +198,8 @@ class AgentLoop(BaseAgentLoop):
 
         for turn in range(1, self.config.max_turns + 1):
             # ── API 调用 ──
-            print(f"  [T{turn}] Calling API...", end="", flush=True)
+            if not self.silent:
+                print(f"  [T{turn}] Calling API...", end="", flush=True)
             try:
                 result = self._call_api(working.messages)
             except Exception as e:
@@ -199,7 +232,8 @@ class AgentLoop(BaseAgentLoop):
             # 命中可视化
             hit_bar = "█" * min(int(hit_rate // 10), 10)
             miss_bar = "░" * (10 - len(hit_bar))
-            print(f" hit={h:4d} miss={m:4d} [{hit_bar}{miss_bar}] {hit_rate:5.1f}%")
+            if not self.silent:
+                print(f" hit={h:4d} miss={m:4d} [{hit_bar}{miss_bar}] {hit_rate:5.1f}%")
 
             if finish == "tool_calls" and message.get("tool_calls"):
                 # 工具调用轮次 — 记录消息范围
@@ -227,8 +261,9 @@ class AgentLoop(BaseAgentLoop):
                         continue
 
                     handler = get_tool_handler(fn_name)
-                    print(f"\n  $ {fn_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in args.items())})",
-                          end="", flush=True)
+                    if not self.silent:
+                        print(f"\n  $ {fn_name}({', '.join(f'{k}={repr(v)[:40]}' for k, v in args.items())})",
+                              end="", flush=True)
 
                     if handler:
                         try:
@@ -299,7 +334,7 @@ class AgentLoop(BaseAgentLoop):
         discard_label = "✓ DISCARD" if will_discard else "- KEEP"
 
         # ── 任务命中趋势分析 ──
-        if self.current_task_requests:
+        if self.current_task_requests and not self.silent:
             hits = [r.cache_hit for r in self.current_task_requests]
             misses = [r.cache_miss for r in self.current_task_requests]
             first_hit_rate = hits[0] / (hits[0] + misses[0]) * 100 if (hits[0] + misses[0]) > 0 else 0
@@ -320,38 +355,44 @@ class AgentLoop(BaseAgentLoop):
             print(f"  │  ΔHit:    {last_hit_rate - first_hit_rate:+5.1f}%{' ' * 48}│")
             print(f"  └{'─' * 66}┘")
 
-        print(f"  {self.task_judge.explain(verdict)}")
+        if not self.silent:
+            print(f"  {self.task_judge.explain(verdict)}")
 
         # ── 上下文用量 ──
-        print(f"\n  ┌{'─' * 56}┐")
-        print(f"  │  Context Usage{' ' * 46}│")
-        print(f"  ├{'─' * 56}┤")
-        print(f"  │  Permanent:  {analysis.permanent.tokens:5d} tokens  ({analysis.permanent.message_count:2d} msgs){' ' * 22}│")
-        print(f"  │  Temporary:  {analysis.temporary.tokens:5d} tokens  ({analysis.temporary.message_count:2d} msgs){' ' * 22}│")
-        print(f"  │  Natural:    {analysis.natural.tokens:5d} tokens  ({analysis.natural.message_count:2d} msgs){' ' * 22}│")
-        print(f"  ├{'─' * 56}┤")
-        print(f"  │  Total:      {analysis.total_tokens:5d} tokens{' ' * 36}│")
-        print(f"  │  Hit Rate:   {analysis.hit_rate:5.1f}%{' ' * 40}│")
-        print(f"  │  Est. Cost:  ${analysis.cost_estimate_with_cache:.6f}{' ' * 33}│")
-        print(f"  └{'─' * 56}┘")
+        if not self.silent:
+            print(f"\n  ┌{'─' * 56}┐")
+            print(f"  │  Context Usage{' ' * 46}│")
+            print(f"  ├{'─' * 56}┤")
+            print(f"  │  Permanent:  {analysis.permanent.tokens:5d} tokens  ({analysis.permanent.message_count:2d} msgs){' ' * 22}│")
+            print(f"  │  Temporary:  {analysis.temporary.tokens:5d} tokens  ({analysis.temporary.message_count:2d} msgs){' ' * 22}│")
+            print(f"  │  Natural:    {analysis.natural.tokens:5d} tokens  ({analysis.natural.message_count:2d} msgs){' ' * 22}│")
+            print(f"  ├{'─' * 56}┤")
+            print(f"  │  Total:      {analysis.total_tokens:5d} tokens{' ' * 36}│")
+            print(f"  │  Hit Rate:   {analysis.hit_rate:5.1f}%{' ' * 40}│")
+            print(f"  │  Est. Cost:  ${analysis.cost_estimate_with_cache:.6f}{' ' * 33}│")
+            print(f"  └{'─' * 56}┘")
 
         # ── 合并决策 ──
         if not verdict.is_low_value:
-            # KEEP: 根据 merge_mode 选择合并策略
-            if self.config.discard.merge_mode == "parallel":
-                n = self.context.merge_parallel(working)
-                if self.config.verbose:
-                    print(f"  [Parallel merge] Appended {n} messages")
-            else:
-                self.context.replace_with(working)
+            # KEEP: 根据 merge_on_keep 决定是否修改共享上下文
+            if self.config.discard.merge_on_keep:
+                if self.config.discard.merge_mode == "parallel":
+                    n = self.context.merge_parallel(working)
+                    if self.config.verbose and not self.silent:
+                        print(f"  [Parallel merge] Appended {n} messages")
+                else:
+                    self.context.replace_with(working)
+            self.stats.incr_task(kept=True)
             return
 
         if not self.config.discard.auto_discard:
             # dry-run 模式: 保留 working
-            if self.config.discard.merge_mode == "parallel":
-                self.context.merge_parallel(working)
-            else:
-                self.context.replace_with(working)
+            if self.config.discard.merge_on_keep:
+                if self.config.discard.merge_mode == "parallel":
+                    self.context.merge_parallel(working)
+                else:
+                    self.context.replace_with(working)
+            self.stats.incr_task(kept=True)
             return
 
         # DISCARD: 仅存标记，不修改上下文（保持前缀完整）
@@ -369,9 +410,9 @@ class AgentLoop(BaseAgentLoop):
         )
         self._pending_discard_hint = hint
 
-        self.stats.discarded_tasks += 1
-        self.stats.tokens_saved += working_natural_tokens
-        print(f"  Discard effect: saved {working_natural_tokens} tokens (context unchanged, hint queued)")
+        self.stats.incr_task(kept=False, saved=working_natural_tokens)
+        if not self.silent:
+            print(f"  Discard effect: saved {working_natural_tokens} tokens (context unchanged, hint queued)")
 
     def _extract_messages_for_requests(self, working: ContextManager,
                                        requests: List[SubRequest]) -> List[dict]:
@@ -395,14 +436,32 @@ class AgentLoop(BaseAgentLoop):
 
     def print_stats(self):
         """打印统计信息"""
-        hit_rate = self.stats.total_hit / self.stats.total_prompt * 100 if self.stats.total_prompt else 0
+        hit_rate = self.stats.total_hit / self.stats.total_prompt_tokens * 100 if self.stats.total_prompt_tokens else 0
         print(f"\n{'=' * 60}")
-        print("Stats")
+        print(f"Stats  (session: {self.session_id})")
         print(f"{'=' * 60}")
         print(f"  requests:   {self.stats.requests}")
-        print(f"  prompt:     {self.stats.total_prompt} (hit {self.stats.total_hit}, miss {self.stats.total_miss}, {hit_rate:.1f}% hit)")
-        print(f"  output:     {self.stats.total_output} (reasoning {self.stats.total_reasoning})")
+        print(f"  prompt:     {self.stats.total_prompt_tokens} (hit {self.stats.total_hit}, miss {self.stats.total_miss}, {hit_rate:.1f}% hit)")
+        print(f"  output:     {self.stats.total_completion_tokens} (reasoning {self.stats.total_reasoning})")
         print(f"  cost:       ${self.stats.total_cost:.6f}")
         if self.stats.discarded_tasks > 0:
             print(f"  discarded:  {self.stats.discarded_tasks} tasks, saved {self.stats.tokens_saved} tokens")
         print(f"{'=' * 60}")
+
+    def _persist_session(self):
+        """程序退出时持久化会话统计到文件"""
+        try:
+            sessions_dir = Path.home() / ".dogrider" / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            filepath = sessions_dir / f"{self.session_id}.json"
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump({
+                    "session_id": self.session_id,
+                    "created_at": self._created_at,
+                    "closed_at": datetime.now().isoformat(),
+                    "model": self.config.model.model,
+                    "merge_mode": self.config.discard.merge_mode,
+                    **asdict(self.stats),
+                }, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass  # 持久化失败不中断程序

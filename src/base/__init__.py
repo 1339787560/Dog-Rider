@@ -6,5 +6,19 @@ from .config import BaseConfig, ModelConfig
 from .context import BaseContext
 from .agent import BaseAgentLoop
 from .tools import BaseToolRegistry
+from .configManager import ConfigManager, load_config, Config, ModelConfig, DiscardConfig, ContextConfig, PricingConfig
 
-__all__ = ["BaseConfig", "ModelConfig", "BaseContext", "BaseAgentLoop", "BaseToolRegistry"]
+__all__ = [
+    "BaseConfig",
+    "ModelConfig",
+    "BaseContext",
+    "BaseAgentLoop",
+    "BaseToolRegistry",
+    "ConfigManager",
+    "load_config",
+    "Config",
+    "DiscardConfig",
+    "ContextConfig",
+    "PricingConfig",
+]
+

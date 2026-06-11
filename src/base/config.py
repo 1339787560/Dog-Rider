@@ -15,6 +15,7 @@ class ModelConfig:
     model: str = "deepseek-chat"
     max_tokens: int = 4096
     timeout: int = 120
+    temperature: float = 0.0
 
 
 @dataclass

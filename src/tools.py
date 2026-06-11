@@ -487,6 +487,8 @@ TOOL_HANDLERS: Dict[str, Callable] = {
     ),
     "glob": lambda **kwargs: _glob(kwargs.get("pattern", ""), kwargs.get("path", "")),
     "grep": lambda **kwargs: _grep(kwargs.get("pattern", ""), kwargs.get("path", ""), kwargs.get("glob_filter", "")),
+    "task_write_jsonl": lambda **kwargs: task_write_jsonl(kwargs.get("filepath", ""), **{k: v for k, v in kwargs.items() if k != "filepath"}),
+    "task_read_jsonl": lambda **kwargs: task_read_jsonl(kwargs.get("filepath", ""), kwargs.get("limit", 0)),
 }
 
 
@@ -499,8 +501,55 @@ def detect_role_from_tool_name(name: str) -> str:
     """根据工具名称推断子请求角色"""
     if name in ("read_file", "glob", "grep"):
         return "read"
-    if name in ("write_file", "edit_file"):
+    if name in ("write_file", "edit_file", "task_write_jsonl"):
         return "write"
     if name in ("bash",):
         return "exploration"
+    if name in ("task_read_jsonl",):
+        return "read"
     return "analyze"
+
+
+# ========== 任务间 JSONL 通信工具 ==========
+
+def task_write_jsonl(filepath, **fields):
+    """任务产出写入 JSONL（原子操作，并发安全）
+
+    用临时文件 rename 保证写入原子性，多个 worker 同时写不冲突。
+    不修改 agent 上下文，只写外部存储。
+    """
+    import json
+    import tempfile
+    import os
+    path = PROJECT_ROOT / filepath
+    line = json.dumps(fields, ensure_ascii=False) + "\n"
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, 'a', encoding='utf-8') as f:
+            f.write(line)
+        os.replace(tmp_path, path)
+    except:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    return "appended 1 line to " + filepath
+
+
+def task_read_jsonl(filepath, limit=0):
+    """读取 JSONL 文件全部内容（只读，不修改共享上下文）
+
+    返回 JSON 对象列表，供模型决策使用。
+    """
+    import json
+    path = PROJECT_ROOT / filepath
+    if not path.exists():
+        return []
+    results = []
+    with open(path, encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if limit > 0 and i >= limit:
+                break
+            line = line.strip()
+            if line:
+                results.append(json.loads(line))
+    return results

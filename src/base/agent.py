@@ -52,10 +52,15 @@ class BaseAgentLoop:
 
     def _call_api(self, messages: List[dict]) -> dict:
         """调用 LLM API — 自动重试 + 指数退避"""
+        # 并行模式且开启冻结时，强制 temperature=0 保证确定性
+        temp = 0.0 if (hasattr(self.config, 'discard')
+                       and self.config.discard.merge_mode == "parallel"
+                       and getattr(self.config.discard, 'isFrozenForParallel', True)) else self.config.model.temperature
         body = {
             "model": self.config.model.model,
             "messages": messages,
             "max_tokens": self.config.model.max_tokens,
+            "temperature": temp,
             "tools": self.tools.get_tool_defs(),
             "tool_choice": "auto",
         }

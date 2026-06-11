@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict
 
+import yaml
+
 from .base.config import BaseConfig, ModelConfig as BaseModelConfig
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -48,6 +50,8 @@ class DiscardConfig:
     max_extract_tokens: int = 500
     auto_discard: bool = True  # True=自动pop, False=仅打印判定
     merge_mode: str = "serial"  # "serial"=全量替换, "parallel"=仅追加
+    merge_on_keep: bool = False  # KEEP 判定时是否合并到共享上下文
+    isFrozenForParallel: bool = True  # 并行模式强制温度为 0
 
 
 @dataclass
@@ -59,22 +63,53 @@ class ContextConfig:
 
 
 @dataclass
+class TestConfig:
+    """测试相关配置"""
+    thread_count: int = 12
+
+
+@dataclass
 class Config(BaseConfig):
     """Dog-Rider 扩展配置 - 增加丢弃策略和三区上下文配置
 
     继承自 BaseConfig，扩展：
     - discard: 任务级丢弃策略参数
     - context: 三区上下文模型参数
+    - test: 测试配置
     """
     discard: DiscardConfig = field(default_factory=DiscardConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    test: TestConfig = field(default_factory=TestConfig)
 
 
 def load_env_config() -> Config:
-    """从环境变量和 .env 文件加载配置"""
+    """从 baseConfig.yaml + 环境变量加载配置"""
     config = Config()
 
-    # 加载 .env
+    # 1. 先从 baseConfig.yaml 加载默认值
+    yaml_path = PROJECT_ROOT / "baseConfig.yaml"
+    if yaml_path.exists():
+        with open(yaml_path, encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+        if "model" in raw:
+            for k, v in raw["model"].items():
+                if hasattr(config.model, k):
+                    setattr(config.model, k, v)
+        if "discard" in raw:
+            for k, v in raw["discard"].items():
+                if hasattr(config.discard, k):
+                    setattr(config.discard, k, v)
+        if "context" in raw:
+            for k, v in raw["context"].items():
+                if hasattr(config.context, k):
+                    setattr(config.context, k, v)
+        if "test" in raw:
+            for k, v in raw["test"].items():
+                if hasattr(config.test, k):
+                    setattr(config.test, k, v)
+
+    # 2. 加载 .env
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
         with open(env_path, encoding="utf-8") as f:
@@ -84,12 +119,11 @@ def load_env_config() -> Config:
                     k, v = line.split("=", 1)
                     os.environ[k.strip()] = v.strip()
 
-    # 模型配置
+    # 3. 环境变量覆盖
     config.model.api_key = os.environ.get("DEEPSEEK_API_KEY", config.model.api_key)
     config.model.base_url = os.environ.get("DEEPSEEK_BASE_URL", config.model.base_url)
     config.model.model = os.environ.get("DEEPSEEK_MODEL", config.model.model)
 
-    # 丢弃策略配置 (支持环境变量覆盖)
     if "DISCARD_AUTO" in os.environ:
         config.discard.auto_discard = os.environ["DISCARD_AUTO"].lower() in ("1", "true", "yes")
     if "DISCARD_THRESHOLD" in os.environ:

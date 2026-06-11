@@ -1,0 +1,55 @@
+# Dog-Rider Base Configuration
+# 所有配置项的默认值和说明
+
+model:
+  # API Key (优先从环境变量 DEEPSEEK_API_KEY 读取)
+  api_key: ""
+  # API 地址
+  base_url: "https://api.deepseek.com/v1"
+  # 模型名称
+  model: "deepseek-chat"
+  # 最大输出 token 数
+  max_tokens: 4096
+  # 请求超时秒数
+  timeout: 120
+  # 温度 (0=确定性输出, 1=最大随机性)
+  temperature: 0.0
+
+discard:
+  # 并行模式强制温度为 0 (确保所有 subagent 行为一致)
+  isFrozenForParallel: true
+  # 任务级丢弃策略开关
+  auto_discard: true
+  # 合并模式: serial (全量替换) / parallel (仅追加)
+  merge_mode: "serial"
+  # KEEP 判定时是否修改共享上下文 (False = 永不污染基线)
+  merge_on_keep: false
+
+context:
+  # 三区模型边界
+  # messages[0] = 永久冻结区
+  # messages[1 : natural_zone_start] = 暂时冻结区
+  # messages[natural_zone_start : ] = 自然增长区
+  temporary_zone_start: 1
+  natural_zone_start: 10
+  # DeepSeek 缓存粒度 (128 token 对齐)
+  cache_granularity: 128
+
+pricing:
+  # 价格表：$/M tokens
+  deepseek-chat:
+    miss: 0.14      # 未缓存输入 token 单价
+    hit: 0.0028     # 已缓存输入 token 单价
+    output: 0.28    # 输出 token 单价
+  deepseek-v4-flash:
+    miss: 0.14
+    hit: 0.0028
+    output: 0.28
+  deepseek-v4-pro:
+    miss: 0.435
+    hit: 0.003625
+    output: 0.87
+
+test:
+  # 并发测试默认线程数
+  thread_count: 15
