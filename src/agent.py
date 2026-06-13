@@ -110,6 +110,25 @@ class AgentLoop(BaseAgentLoop):
         self.session_id = str(uuid.uuid4())[:8]  # 会话ID用于持久化
         self._created_at = datetime.now().isoformat()
         self.silent = False  # True=不打印任务过程，仅统计
+        # 持久化（手动初始化，因为绕过了父类）
+        self.session_manager = None
+        self.tools = None  # Dog-Rider 用 ALL_TOOLS 全局变量，不需要 tools 属性
+        if hasattr(config, "persistence") and config.persistence.enabled:
+            from .base.persistence import SessionManager, SerialTrigger, ParallelTrigger
+            cache_dir = Path.cwd() / config.persistence.cache_dir
+            trigger = (
+                ParallelTrigger() if config.discard.merge_mode == "parallel"
+                else SerialTrigger(
+                    interval_sec=config.persistence.checkpoint_interval_sec,
+                    request_threshold=config.persistence.checkpoint_request_threshold,
+                )
+            )
+            self.session_manager = SessionManager(
+                session_id=self.session_id,
+                cache_dir=cache_dir,
+                trigger=trigger,
+                wal_fsync=config.persistence.wal_fsync,
+            )
         # 注册退出时持久化
         atexit.register(self._persist_session)
 
@@ -136,6 +155,7 @@ class AgentLoop(BaseAgentLoop):
         req = urllib.request.Request(url, data=data, headers={
             "Authorization": f"Bearer {self.config.model.api_key}",
             "Content-Type": "application/json",
+            "x-session-id": self.session_id,
         })
 
         try:
@@ -194,7 +214,14 @@ class AgentLoop(BaseAgentLoop):
 
         # 创建隔离工作副本
         working = self.context.snapshot()
-        working.append({"role": "user", "content": user_input})
+        user_msg = {"role": "user", "content": user_input}
+        working.append(user_msg)
+        # WAL 记录用户消息
+        if self.session_manager:
+            self.session_manager.append_wal("message", message=user_msg)
+
+        consecutive_failures = 0
+        max_failures = getattr(self.config, "max_consecutive_failures", 2)
 
         for turn in range(1, self.config.max_turns + 1):
             # ── API 调用 ──
@@ -202,11 +229,25 @@ class AgentLoop(BaseAgentLoop):
                 print(f"  [T{turn}] Calling API...", end="", flush=True)
             try:
                 result = self._call_api(working.messages)
+                consecutive_failures = 0
             except Exception as e:
+                consecutive_failures += 1
+                err_text = f"API call failed after {self.config.max_retries} retries: {e}"
+                if consecutive_failures >= max_failures:
+                    # 快速失败：连续多次 API 错误直接放弃
+                    # ANSI 红色 + 加粗
+                    RED = "\033[1;31m"
+                    RESET = "\033[0m"
+                    if not self.silent:
+                        print(f"\n  {RED}[Aborted] {consecutive_failures} consecutive API failures{RESET}")
+                        print(f"  {RED}{err_text}{RESET}")
+                    # 不调 _handle_task_end (跳过 context usage 显示 + 不保留空任务)
+                    # working 直接丢弃，self.context 完全不变
+                    return f"{RED}(Task aborted: {err_text}){RESET}"
                 # 注入错误消息让 LLM 感知，继续循环
                 working.append({
                     "role": "system",
-                    "content": f"[ERROR] API call failed after {self.config.max_retries} retries: {e}. "
+                    "content": f"[ERROR] {err_text}. "
                                f"Please continue with what you know, or try a different approach.",
                 })
                 continue
@@ -320,7 +361,12 @@ class AgentLoop(BaseAgentLoop):
         KEEP    → working 替换 self.context
         DISCARD → working 丢弃，self.context 不变
         PARTIAL → 提取高价值消息合并入 self.context
+        空任务 → 直接返回，不显示 verdict / context usage / 合并
         """
+        # 空任务（无成功的 API 请求）→ 不保留、不显示
+        if not self.current_task_requests:
+            return
+
         analysis = working.analyze()
         context_total = analysis.total_tokens
 
@@ -450,6 +496,23 @@ class AgentLoop(BaseAgentLoop):
 
     def _persist_session(self):
         """程序退出时持久化会话统计到文件"""
+        # 关闭 SessionManager (flush WAL + 强制 checkpoint)
+        if self.session_manager:
+            try:
+                from .base.persistence import SessionState
+                state = SessionState(
+                    session_id=self.session_id,
+                    created_at=self._created_at,
+                    updated_at=datetime.now().isoformat(),
+                    model=self.config.model.model,
+                    messages=list(self.context.messages),
+                    stats=asdict(self.stats),
+                )
+                self.session_manager.maybe_checkpoint(state, force=True)
+                self.session_manager.close()
+            except Exception:
+                pass
+
         try:
             sessions_dir = Path.home() / ".dogrider" / "sessions"
             sessions_dir.mkdir(parents=True, exist_ok=True)

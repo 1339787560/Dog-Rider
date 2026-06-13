@@ -5,7 +5,7 @@ model:
   # API Key (优先从环境变量 DEEPSEEK_API_KEY 读取)
   api_key: ""
   # API 地址
-  base_url: "https://api.deepseek.com/v1"
+  base_url: "http://127.0.0.1:5002/v1"  #  https://api.deepseek.com/v1
   # 模型名称
   model: "deepseek-chat"
   # 最大输出 token 数
@@ -14,6 +14,11 @@ model:
   timeout: 120
   # 温度 (0=确定性输出, 1=最大随机性)
   temperature: 0.0
+
+# Agent 主循环配置（顶层，对应 BaseConfig 字段）
+max_turns: 50                  # 单任务最大对话轮次
+max_retries: 3                 # 单次 API 调用最大重试次数
+max_consecutive_failures: 2    # 连续失败 N 次直接放弃任务，快速响应
 
 discard:
   # 并行模式强制温度为 0 (确保所有 subagent 行为一致)
@@ -52,4 +57,16 @@ pricing:
 
 test:
   # 并发测试默认线程数
-  thread_count: 15
+  thread_count: 20
+
+persistence:
+  # 启用会话持久化
+  enabled: true
+  # WAL 是否每次写入后 fsync (确保落盘但有性能开销)
+  wal_fsync: true
+  # 串行模式：checkpoint 时间间隔（秒）
+  checkpoint_interval_sec: 60
+  # 串行模式：checkpoint 请求次数阈值
+  checkpoint_request_threshold: 20
+  # 持久化目录（相对项目根目录）
+  cache_dir: ".cache/sessions"

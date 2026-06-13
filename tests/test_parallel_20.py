@@ -28,13 +28,16 @@ class ThreadResult:
 
 
 def run_thread(config: Config, system_prompt_messages: list, prompt: str,
-              results: list, lock: threading.Lock):
-    """每个线程独立创建 Agent，完全独立统计"""
+              results: list, lock: threading.Lock, shared_session_id: str = ""):
+    """每个线程独立 Agent，但共享 session_id（统一汇报到同一会话）"""
     tid = threading.get_ident()
     result = ThreadResult(thread_id=tid)
 
     agent = AgentLoop(config)
     agent.silent = True
+    # 共享 session_id（如有），让 proxy 把所有线程汇总到同一会话
+    if shared_session_id:
+        agent.session_id = shared_session_id
     # 复制预热好的上下文（深拷贝消息内容）
     agent.context.messages = [dict(m) for m in system_prompt_messages]
 
@@ -85,7 +88,8 @@ def main():
     for i in range(thread_count):
         t = threading.Thread(
             target=run_thread,
-            args=(config, baseline_messages, "介绍一下你自己", results, results_lock),
+            args=(config, baseline_messages, "介绍一下你自己", results, results_lock,
+                  warmup_agent.session_id),
             name=f"worker-{i:02d}"
         )
         threads.append(t)

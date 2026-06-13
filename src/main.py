@@ -8,6 +8,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from .agent import AgentLoop
+from .commands import CommandRegistry
 from .config import load_env_config
 from .scenarios import run_scenario, run_all_scenarios, SCENARIOS
 
@@ -46,10 +47,14 @@ def main():
     # 交互模式
     print(f"Dog-Rider Agent v0.1.0 | model={config.model.model}")
     print(f"Auto discard: {'ON' if config.discard.auto_discard else 'OFF'}")
-    print(f"Commands: /stats /context /quit")
+    print(f"Type /help for commands.")
     print()
 
     agent = AgentLoop(config)
+    commands = CommandRegistry()
+
+    print(f"Session: {agent.session_id}  (use /resume <id> to resume an old session)")
+    print()
 
     while True:
         try:
@@ -60,14 +65,14 @@ def main():
 
         if not user_input:
             continue
-        if user_input == "/quit":
-            agent.print_stats()
-            break
-        if user_input == "/stats":
-            agent.print_stats()
-            continue
-        if user_input == "/context":
-            print(agent.context.report())
+
+        # ── Slash 命令分发 ──
+        if user_input.startswith("/"):
+            result = commands.dispatch(user_input, agent)
+            if result.output:
+                print(result.output)
+            if not result.should_continue:
+                break
             continue
 
         try:

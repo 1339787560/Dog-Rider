@@ -69,6 +69,16 @@ class TestConfig:
 
 
 @dataclass
+class PersistenceConfig:
+    """会话持久化配置"""
+    enabled: bool = True
+    wal_fsync: bool = True
+    checkpoint_interval_sec: int = 60
+    checkpoint_request_threshold: int = 20
+    cache_dir: str = ".cache/sessions"
+
+
+@dataclass
 class Config(BaseConfig):
     """Dog-Rider 扩展配置 - 增加丢弃策略和三区上下文配置
 
@@ -76,10 +86,12 @@ class Config(BaseConfig):
     - discard: 任务级丢弃策略参数
     - context: 三区上下文模型参数
     - test: 测试配置
+    - persistence: 会话持久化配置
     """
     discard: DiscardConfig = field(default_factory=DiscardConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     test: TestConfig = field(default_factory=TestConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
 
 
 def load_env_config() -> Config:
@@ -96,6 +108,10 @@ def load_env_config() -> Config:
             for k, v in raw["model"].items():
                 if hasattr(config.model, k):
                     setattr(config.model, k, v)
+        # 顶层标量字段：max_turns / max_retries / max_consecutive_failures / verbose
+        for top_key in ("max_turns", "max_retries", "max_consecutive_failures", "verbose"):
+            if top_key in raw and hasattr(config, top_key):
+                setattr(config, top_key, raw[top_key])
         if "discard" in raw:
             for k, v in raw["discard"].items():
                 if hasattr(config.discard, k):
@@ -108,6 +124,10 @@ def load_env_config() -> Config:
             for k, v in raw["test"].items():
                 if hasattr(config.test, k):
                     setattr(config.test, k, v)
+        if "persistence" in raw:
+            for k, v in raw["persistence"].items():
+                if hasattr(config.persistence, k):
+                    setattr(config.persistence, k, v)
 
     # 2. 加载 .env
     env_path = PROJECT_ROOT / ".env"
