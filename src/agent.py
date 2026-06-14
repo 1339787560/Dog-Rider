@@ -62,14 +62,13 @@ class DogRiderUsageStats(BaseUsageStats):
 
 
 def load_system_prompt() -> str:
-    """加载系统提示词：SYS/SystemPrompt.md + SYS/Claude-Core-Toolkit.md + CLAUDE.md"""
+    """加载系统提示词：SYS/SystemPrompt.md + SYS/Claude-Core-Toolkit.md + SYS/Dog-Rider-Protocol.md"""
     base_path = Path(__file__).parent
-    project_root = base_path.parent
 
     files = [
         base_path / "SYS" / "SystemPrompt.md",        # Agent 行为基础规范
         base_path / "SYS" / "Claude-Core-Toolkit.md",  # 核心工具集使用指南
-        project_root / "CLAUDE.md",                    # Dog-Rider 框架协议
+        base_path / "SYS" / "Dog-Rider-Protocol.md",   # Dog-Rider 框架协议
     ]
 
     parts = []
