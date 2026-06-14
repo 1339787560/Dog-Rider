@@ -36,3 +36,5 @@ Dog-Rider/
 
 - 创建新 Skill 时必须遵循 `Skills/Skill-Writer.md` 规范
 - 撰写文档前必须先 `Read` `Skills/Doc-Writer.md` 加载文档写作规范
+- **编写优化性文档、或一次性完善交付的需求时，必须先 `Read` `Skills/Doc-Writer.md` + `Skills/Code-Planner.md`，确保覆盖充分完善**
+- 编程任务系统性规划时，必须按 `Skills/Code-Planner.md` 规范输出四区块（需求拆解 + 实现方案 + BDD + 测试）
